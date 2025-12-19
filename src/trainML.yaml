@@ -1,0 +1,23 @@
+folder: /home/sshabani/projects/balt_experiment/data/BAlt_Expirement
+excel:  /home/sshabani/projects/balt_experiment/data/BAlt_Expirement/bAlt_scores_complete.xlsx
+id_column: SampleID
+tertile_column: Tertile
+pattern: "**/*DAPI.tif"
+cuda: 1
+val_ratio: 0.2
+batch_size: 1
+epochs: 30
+lr: 0.001
+wd: 0.0001
+outdir: checkpoints
+seed: 42
+
+## model details
+backbone: resnet101 #resautoencoder #resnet101 #autoencoder #efficientvit_ #efficientvit_ 
+merge_mode: max #mean #mean_median #mean_median #mean_median #max
+in_channels: 3
+out_channels: 3
+encoder_out: vector
+
+## load the weights for autoencoder
+ckpt_path: checkpoints/best.pt

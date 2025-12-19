@@ -1,0 +1,8 @@
+balt_env/
+checkpoints/
+data/
+plots/
+pretrained_weights/
+resutls/
+runs/
+*.deb

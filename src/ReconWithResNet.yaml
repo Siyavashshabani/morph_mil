@@ -1,0 +1,34 @@
+folder: /home/sshabani/projects/balt_experiment/data/BAlt_Expirement
+excel:  /home/sshabani/projects/balt_experiment/data/BAlt_Expirement/bAlt_scores_complete.xlsx
+id_column: SampleID
+tertile_column: Tertile
+pattern: "**/*DAPI.tif"
+
+val_ratio: 0.2
+batch_size: 2
+epochs: 100
+lr: 0.0001
+wd: 0.0001
+outdir: checkpoints
+seed: 42
+
+## model details
+backbone: resautoencoder #resnet101_ae #autoencoder #resnet101_ae #efficientvit_ #resnet101
+out_channels: 3
+in_channels: 3
+out_activation: sigmoid
+pretrained_encoder: True
+freeze_encoder: False
+encoder_out: map #avgpool #map
+## train 
+mode: train #train #train #test
+epochs: 300
+loss: mse
+tb_logdir: runs/
+scheduler: plateau #onecycle
+
+
+## test 
+test_batches: 1 
+test_nrow: 8
+use_best: True

@@ -1,0 +1,25 @@
+## define the cuda 
+cuda: 1
+
+
+## data 
+data_path: "data/BAlt_Expirement/precomputeResNet"
+# data_path: "data/BAlt_Expirement/precomputeOverlappedResNet"
+n_classes: 2
+
+## training 
+mode: train #train #train #test
+batch_size: 8 
+epochs: 200 #3 #200
+
+##optimizer 
+lr: 3e-5 #4e-5
+wd: 5e-3
+scheduler: plateau
+
+## model
+backbone: poolMIL #TransMIL
+pool: mean_median #max #max   attn
+emd_dim: 512
+trans: nystrom #mamba #att #nystrom att
+ppeg: norm #addaptive #norm

@@ -1,0 +1,34 @@
+## define the cuda 
+cuda: 1
+
+
+## data
+# data_path: "data/BAlt_Expirement/precomputeResNet"
+# data_path: "data/BAlt_Expirement/precomputeresnet101"
+data_path: "data/BAlt_Expirement/precomputeDINOv3"
+
+# data_path: "data/BAlt_Expirement/precomputeOverlappedResNet"
+n_classes: 2
+
+## training 
+mode: train #train #train #test
+batch_size: 8 
+epochs: 200 #3 #200
+
+##optimizer 
+lr: 5e-5 #4e-5
+wd: 5e-3
+scheduler: plateau
+
+## model
+base_bakcbone: dinov3 #resnet #dinov3
+backbone: adMIL #poolMIL #TransMIL
+pool: mean_median #max #max   attn
+emd_dim: 512
+trans: nystrom #mamba #att #nystrom att
+ppeg: norm #addaptive #norm
+
+
+## visualization
+att_vis: False # True
+att_map_mode: soft #hard #soft
