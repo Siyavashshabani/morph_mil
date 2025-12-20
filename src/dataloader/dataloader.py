@@ -1,454 +1,530 @@
-# pip install pandas openpyxl tifffile torch torchvision
+from __future__ import annotations
 
-import os, glob, re
+from torch.utils.data import DataLoader, Subset
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple, Any
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms as T
-import tifffile
 import pandas as pd
 import torch
-import torch.nn.functional as F
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode as IM
-from torchvision.transforms import InterpolationMode  # <-- add this
+from torch.utils.data import Dataset, DataLoader
+import h5py
+from dataclasses import dataclass
 from pathlib import Path
-from pathlib import Path
-from collections import defaultdict
-from torch.utils.data import Subset
-import random, re
-
-_PNUM_RE = re.compile(r"[._-]p(\d+)", flags=re.IGNORECASE)  # matches ...p123...
 
 
-import torch
-from torchvision import transforms as T
-try:
-    from torchvision.transforms import InterpolationMode as IM
-except Exception:
-    from PIL import Image as IM  # use IM.BILINEAR, IM.NEAREST, etc.
-
-from .utils import save_batch_patches
-# --- per-image min-max normalization to [0,1]
-class MinMax01(object):
-    def __call__(self, x):  # x: (C,H,W) float tensor
-        xmin = x.amin(dim=(1,2), keepdim=True)
-        xmax = x.amax(dim=(1,2), keepdim=True)
-        return (x - xmin) / (xmax - xmin).clamp(min=1e-6)
-
-# --- patchify into 256×256 tiles ---
-class Patchify256(object):
+def minmax_01_np(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """
-    Split CHW tensor into 256x256 patches.
-    If grid is None, infer grid from H,W (must be multiples of 256).
-    1024x1024 -> 4x4 -> 16 patches.
-    Returns (P, C, 256, 256).
+    Column-wise MinMax normalization to [0,1].
+    Constant columns become all-zeros.
+    NaN/inf are converted to 0 before computing min/max.
     """
-    def __init__(self, grid=None, interpolation=IM.BILINEAR):
-        self.grid = grid
-        self.interp = interpolation
+    X = np.asarray(X, dtype=np.float32)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def __call__(self, x):  # x: (C,H,W)
-        C, H, W = x.shape
+    mn = X.min(axis=0, keepdims=True)
+    mx = X.max(axis=0, keepdims=True)
+    denom = np.maximum(mx - mn, eps)
 
-        # If a specific grid is requested, resize to its total size
-        if self.grid is not None:
-            gh, gw = self.grid
-            target_h, target_w = gh * 256, gw * 256
-            if (H, W) != (target_h, target_w):
-                x = T.Resize((target_h, target_w), interpolation=self.interp)(x)
-                C, H, W = x.shape
+    Xn = (X - mn) / denom
 
-        # Must be divisible by 256
-        if H % 256 != 0 or W % 256 != 0:
-            raise ValueError(f"Image size {(H,W)} not divisible by 256. Resize/pad first.")
-
-        nH, nW = H // 256, W // 256
-        patches = (
-            x.unfold(1, 256, 256)            # (C, nH, 256, W)
-             .unfold(3, 256, 256)            # (C, nH, 256, nW, 256)
-             .permute(1, 3, 0, 2, 4)         # (nH, nW, C, 256, 256)
-             .contiguous()
-             .view(nH * nW, C, 256, 256)     # (P, C, 256, 256)
-        )
-        return patches
+    # If a column is constant (mx==mn), it becomes 0 everywhere (already, due to denom=eps)
+    return Xn
 
 
 
-class OverlappedPatchify256(object):
+def _stem_no_ext(p: Path) -> str:
+    return p.name[:-len(p.suffix)] if p.suffix else p.name
+
+
+def normalize_slide_id_from_pt(pt_path: Path) -> str:
     """
-    Split a CHW tensor into 256x256 patches with overlap.
-    Returns (P, C, 256, 256). For 1024x1024 and overlap=0.5 -> 7x7=49 patches.
-
-    Args:
-        overlap (float): fraction of patch that overlaps with neighbors, in [0,1).
-                         0.5 -> stride 128 for 256x256 patches.
-        grid (tuple[int,int] | None): if given (gh,gw), first resize to (gh*256, gw*256).
-        interpolation: interpolation mode used for optional resize.
-        pad_mode (str): 'reflect' | 'replicate' | 'constant' for edge padding if needed.
-        pad_value (float): used only if pad_mode='constant'.
+    Example:
+      TCGA-3C-AALI-01Z-00-DX1.F6E9....pt  ->  TCGA-3C-AALI-01Z-00-DX1.F6E9....
+    We keep the full stem (including UUID part) by default.
     """
-    def __init__(self, overlap=0.5, grid=None, interpolation=IM.BILINEAR,
-                 pad_mode="reflect", pad_value=0.0):
-        assert 0.0 <= overlap < 1.0, "overlap must be in [0,1)"
-        self.patch = 256
-        self.stride = max(1, int(round(self.patch * (1.0 - overlap))))
-        self.grid = grid
-        self.interp = interpolation
-        self.pad_mode = pad_mode
-        self.pad_value = pad_value
+    return _stem_no_ext(pt_path)
 
-    def __call__(self, x):  # x: (C,H,W), torch.Tensor
-        C, H, W = x.shape
 
-        # Optional: resize to exact grid size
-        if self.grid is not None:
-            gh, gw = self.grid
-            target_h, target_w = gh * self.patch, gw * self.patch
-            if (H, W) != (target_h, target_w):
-                x = T.Resize((target_h, target_w), interpolation=self.interp)(x)
-                C, H, W = x.shape
+def normalize_slide_id_from_morph_csv(csv_path: Path) -> str:
+    """
+    Example:
+      TCGA-A8-A0A1-01Z-00-DX1.CA64..._cells_patch_morphometrics.csv
+        -> TCGA-A8-A0A1-01Z-00-DX1.CA64...
+    """
+    stem = _stem_no_ext(csv_path)
+    suffix = "_cells_patch_morphometrics"
+    if stem.endswith(suffix):
+        stem = stem[: -len(suffix)]
+    return stem
 
-        # Compute required padding so that unfold covers the full extent with the chosen stride
-        K = self.patch
-        S = self.stride
 
-        def needed_pad(L):
-            if L < K:
-                return K - L
-            rem = (L - K) % S
-            return 0 if rem == 0 else (S - rem)
+def normalize_slide_id_generic(x: str) -> str:
+    """
+    For the labels CSV slide_id column.
+    We try to make it comparable to the PT/Morph IDs.
 
-        pad_h = needed_pad(H)
-        pad_w = needed_pad(W)
-
-        if pad_h or pad_w:
-            # F.pad uses (left, right, top, bottom)
-            if self.pad_mode == "constant":
-                x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=self.pad_value)
-            else:
-                x = F.pad(x, (0, pad_w, 0, pad_h), mode=self.pad_mode)
-            C, H, W = x.shape  # update after padding
-
-        # Unfold with overlap (stride S)
-        patches = (
-            x.unfold(1, K, S)                 # (C, nH, K, W)
-             .unfold(3, K, S)                 # (C, nH, K, nW, K)
-             .permute(1, 3, 0, 2, 4)          # (nH, nW, C, K, K)
-             .contiguous()
-             .view(-1, C, K, K)               # (P, C, 256, 256)
-        )
-
-        return patches
+    If your labels CSV uses only the prefix before the dot (no UUID),
+    you can switch to returning x.split('.')[0].
+    """
+    x = str(x).strip()
+    # default: keep full id
+    return x
 
 
 
-# --- collate: flatten patches into batch dim ---
-def collate_patches_as_batch(batch):
-    imgs = torch.cat([b["image"] for b in batch], dim=0)   # (sum_P, C, 256, 256)
-    tertile_ids = torch.cat([
-        torch.full((b["image"].shape[0],), b["tertile_id"], dtype=torch.long)
-        for b in batch
-    ])
-    tertile_strs = sum([[b["tertile_str"]]*b["image"].shape[0] for b in batch], [])
-    paths = sum([[b["path"]]*b["image"].shape[0] for b in batch], [])
-    return {"image": imgs, "tertile_id": tertile_ids, "tertile_str": tertile_strs, "path": paths}
+def load_h5_embedding(h5_path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    h5_path = Path(h5_path)
+
+    # Safety checks
+    if h5_path.suffix not in [".h5", ".hdf5"]:
+        raise ValueError(f"Expected .h5/.hdf5 file, got: {h5_path}")
+    if not h5py.is_hdf5(str(h5_path)):
+        raise ValueError(f"Not a valid HDF5 file (signature not found): {h5_path}")
+
+    with h5py.File(h5_path, "r") as f:
+        keys = list(f.keys())
+
+        if "features" in f:
+            feats = torch.from_numpy(f["features"][:])
+        elif "feats" in f:
+            feats = torch.from_numpy(f["feats"][:])
+        else:
+            raise KeyError(f"No 'features' or 'feats' in {h5_path}. Keys: {keys}")
+
+        coords = torch.from_numpy(f["coords"][:]) if "coords" in f else None
+
+    meta = {
+        "h5_keys": keys,
+        "features_shape": tuple(feats.shape),
+        "coords_shape": tuple(coords.shape) if coords is not None else None,
+    }
+    return feats, coords, meta
+
+def load_morph_csv(
+    csv_path: Path,
+    drop_non_numeric: bool = True,
+    keep_columns: Optional[List[str]] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], List[str]]:
+    """
+    Reads morph CSV. If coord columns exist, returns them too.
+    Returns: (X [M,K], coords [M,2] or None, feature_names)
+    """
+    df = pd.read_csv(csv_path)
+
+    # detect coord columns (common names)
+    coord_candidates = [
+        ("coord_x", "coord_y"),
+        ("x", "y"),
+        ("patch_x", "patch_y"),
+        ("tile_x", "tile_y"),
+    ]
+    coords = None
+    for cx, cy in coord_candidates:
+        if cx in df.columns and cy in df.columns:
+            coords = df[[cx, cy]].to_numpy()
+            break
+
+    if keep_columns is not None:
+        # user-specified columns
+        missing = [c for c in keep_columns if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns in {csv_path}: {missing}")
+        feat_df = df[keep_columns].copy()
+    else:
+        feat_df = df.copy()
+
+    if drop_non_numeric:
+        # remove obvious non-feature cols
+        # (we keep coords separately if present)
+        non_feature_cols = set()
+        if coords is not None:
+            non_feature_cols |= {cx, cy}
+        # also drop common ID-like columns if present
+        for c in ["slide_id", "wsi", "filename", "patch_id", "tile_id", "cell_id"]:
+            if c in feat_df.columns:
+                non_feature_cols.add(c)
+
+        feat_df = feat_df.drop(columns=[c for c in non_feature_cols if c in feat_df.columns], errors="ignore")
+        feat_df = feat_df.select_dtypes(include=[np.number])
+
+    feature_names = list(feat_df.columns)
+    X = feat_df.to_numpy(dtype=np.float32)
+
+    return X, coords, feature_names
 
 
+def align_morph_to_coords(
+    bag_coords: torch.Tensor,  # [N,2]
+    morph_X: np.ndarray,       # [M,K]
+    morph_coords: np.ndarray,  # [M,2]
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    if bag_coords.ndim != 2 or bag_coords.shape[1] != 2:
+        raise ValueError("bag_coords must be [N,2]")
 
+    # Ensure numeric, remove NaNs in morph features
+    morph_X = np.asarray(morph_X, dtype=np.float32)
+    morph_X = np.nan_to_num(morph_X, nan=0.0, posinf=0.0, neginf=0.0)
 
-import torch
-from PIL import Image
+    # Build mapping: (x,y) -> mean morph vector (handles duplicates)
+    dfm = pd.DataFrame(morph_X)
+    dfm["x"] = morph_coords[:, 0].astype(np.int64)
+    dfm["y"] = morph_coords[:, 1].astype(np.int64)
+    grouped = dfm.groupby(["x", "y"], sort=False).mean(numeric_only=True)
 
-class ReplicateTo3Channels:
-    def __call__(self, x):
-        # PIL image path
-        if isinstance(x, Image.Image):
-            # ensure it's single-channel first (L) then convert to RGB
-            if x.mode not in ("L", "I;16", "I"):
-                # already multi-channel; leave it as-is
-                return x
-            return x.convert("RGB")
+    bc = bag_coords.detach().cpu().numpy()
+    bcx = bc[:, 0].astype(np.int64)
+    bcy = bc[:, 1].astype(np.int64)
 
-        # Torch tensor path
-        if isinstance(x, torch.Tensor):
-            # accept [H,W] → [1,H,W]
-            if x.ndim == 2:
-                x = x.unsqueeze(0)
-            # replicate if single-channel
-            if x.ndim == 3 and x.shape[0] == 1:
-                x = x.repeat(3, 1, 1)  # explicit copy; safer than expand
-            return x
+    out = np.full((bc.shape[0], morph_X.shape[1]), fill_value, dtype=np.float32)
 
-        # Fallback: return input unchanged
-        return x
+    for i in range(bc.shape[0]):
+        key = (bcx[i], bcy[i])
+        if key in grouped.index:
+            out[i] = grouped.loc[key].to_numpy(dtype=np.float32)
 
+    return out
 
-def extract_pnum_from_filename(path: str):
-    """Return the numeric p-id (as string) from a filename or None if not found."""
-    m = _PNUM_RE.search(os.path.basename(path))
-    # print("m-----------------------",m, type(m))
-    return m.group(1) if m else None
+@dataclass
+class BRCAItem:
+    slide_id: str
+    h5_path: Path
+    morph_path: Path
+    label: int
 
-def extract_pnum_from_sampleid(s: str):
-    """Return the numeric p-id (as string) from a SampleID string like 'X1b.p203'."""
-    if s is None:
-        return None
-    s = str(s)
-    m = _PNUM_RE.search(s)
-    return m.group(1) if m else None
-
-def normalize_tertile(val: str):
-    """Map various strings to {'low','mid','high'}."""
-    if val is None:
-        return None
-    s = str(val).strip().lower()
-    # normalize spaces/underscores and Greek beta → 'b'
-    s = s.replace("β", "b").replace(" ", "").replace("_", "")
-    # allow variants like 'lowbalt', 'high-balt', etc.
-    if "low" in s:
-        return "low"
-    if "mid" in s or "medium" in s:
-        return "mid"
-    if "high" in s:
-        return "high"
-    return None
-
-class TiffDataset(Dataset):
+class BRCAEmbedMorphDataset(Dataset):
     def __init__(
         self,
-        folder,
-        excel_path,
-        pattern="**/*DAPI*.tif",   # recursive
-        id_column="SampleID",      # column with strings like 'X1b.p203'
-        tertile_column="Tertile",  # column with Low/Mid/High (or variants)
-        transform=None,
-        keep_labels=("low", "high"),   # <--- NEW: only keep these
-        binarize=True,                 # <--- NEW: map low->0, high->1
+        h5_dir: str | Path,
+        morph_dir: str | Path,
+        labels_csv: str | Path,
+        label_col: str = "label",
+        slide_id_col: str = "slide_id",
+        keep_morph_columns: Optional[List[str]] = None,
+        align_by_coords_if_possible: bool = True,
+        strict: bool = True,
     ):
-        # 1) Collect image files
-        pat = re.compile(r"DAPI(?:_\d+)?\.(?:tif|tiff)$", flags=re.IGNORECASE)
-        all_tifs = list(Path(folder).rglob("*.tif")) + list(Path(folder).rglob("*.tiff"))
-        self.files = sorted({str(p) for p in all_tifs if pat.search(p.name)})
-        if not self.files:
-            raise FileNotFoundError(f"No TIFFs found under {folder}")
-        self.transform = transform
+        self.h5_dir = Path(h5_dir)
+        self.morph_dir = Path(morph_dir)
+        self.labels_csv = Path(labels_csv)
 
-        # 2) Load Excel and build pnum -> tertile mapping
-        df = pd.read_excel(excel_path)
-        df["_pnum"] = df[id_column].map(extract_pnum_from_sampleid)
-        df["_tertile_norm"] = df[tertile_column].map(normalize_tertile)
+        if not self.h5_dir.exists():
+            raise FileNotFoundError(f"h5_dir not found: {self.h5_dir}")
+        if not self.morph_dir.exists():
+            raise FileNotFoundError(f"morph_dir not found: {self.morph_dir}")
+        if not self.labels_csv.exists():
+            raise FileNotFoundError(f"labels_csv not found: {self.labels_csv}")
 
-        # Build mapping; if duplicates exist, keep the first non-null label
-        p2tertile = {}
-        for _, row in df.iterrows():
-            p = row["_pnum"]
-            t = row["_tertile_norm"]
-            if p and t and p not in p2tertile:
-                p2tertile[p] = t
-        self.p2tertile = p2tertile
+        self.keep_morph_columns = keep_morph_columns
+        self.align_by_coords_if_possible = align_by_coords_if_possible
+        self.strict = strict
 
-        # 3) Filter files to ONLY the labels we want (e.g., low/high)
-        keep = set(keep_labels) if keep_labels else None
-        if keep:
-            filtered = []
-            for f in self.files:
-                pnum = str(int(extract_pnum_from_filename(f)))
-                t = self.p2tertile.get(pnum, None)
-                if t in keep:
-                    filtered.append(f)
-            self.files = filtered
-            if not self.files:
-                raise RuntimeError("After filtering, no files remain (check keep_labels and Excel mapping).")
+        # ---- load labels ----
+        df_lab = pd.read_csv(self.labels_csv)
+        if slide_id_col not in df_lab.columns or label_col not in df_lab.columns:
+            raise ValueError(
+                f"labels_csv must contain columns {slide_id_col!r} and {label_col!r}. "
+                f"Got: {list(df_lab.columns)}"
+            )
 
-        # 4) Label mapping (binary or 3-class)
-        if binarize:
-            # only low/high expected due to filtering
-            self.label_to_id = {"low": 0, "high": 1}
+        # map slide_id -> label (raw first)
+        labels_map: Dict[str, Any] = {}
+        for _, r in df_lab.iterrows():
+            sid = normalize_slide_id_generic(r[slide_id_col])
+            labels_map[sid] = r[label_col]
+
+        # ---- FIXED binary mapping: IDC / ILC ----
+        # Normalize labels to avoid "idc", " IDC ", etc.
+        labels_map = {k: str(v).strip().upper() for k, v in labels_map.items()}
+
+        allowed = {"IDC", "ILC"}
+        uniq = set(labels_map.values())
+        bad = uniq - allowed
+        if bad:
+            raise ValueError(f"Unexpected labels found: {bad}. Expected only {allowed}.")
+
+        # Choose your encoding (IDC=0, ILC=1)
+        self.label_to_int = {"IDC": 0, "ILC": 1}
+        self.int_to_label = {0: "IDC", 1: "ILC"}
+
+        # ---- index H5 files ----
+        h5_map: Dict[str, Path] = {}
+        for p in sorted(self.h5_dir.glob("*.h5")):
+            h5_map[p.stem] = p
+        for p in sorted(self.h5_dir.glob("*.hdf5")):
+            h5_map[p.stem] = p
+            
+        # ---- index morph CSV files ----
+        morph_map: Dict[str, Path] = {}
+        for c in sorted(self.morph_dir.glob("*.csv")):
+            sid = normalize_slide_id_from_morph_csv(c)
+            morph_map[sid] = c
+
+        # ---- build items: intersection of (pt, morph, label) ----
+        keys = set(h5_map.keys()) & set(morph_map.keys())
+
+        items: List[BRCAItem] = []
+        missing_label = 0
+
+        for sid in sorted(keys):
+            label_val = None
+            if sid in labels_map:
+                label_val = labels_map[sid]
+            else:
+                sid_prefix = sid.split(".")[0]
+                if sid_prefix in labels_map:
+                    label_val = labels_map[sid_prefix]
+
+            if label_val is None:
+                missing_label += 1
+                if strict:
+                    continue  # skip
+                else:
+                    label_int = -1
+            else:
+                # label_val is now guaranteed "IDC" or "ILC"
+                label_int = self.label_to_int[label_val]
+
+            items.append(
+                BRCAItem(
+                    slide_id=sid,
+                    h5_path=h5_map[sid],
+                    morph_path=morph_map[sid],
+                    label=label_int,
+                )
+            )
+        print("len(self.items)----------------------------", len(items))
+        if strict and len(items) == 0:
+            raise RuntimeError(
+                "No matched items found. Likely slide_id formatting mismatch.\n"
+                f"Example PT key: {next(iter(pt_map.keys())) if pt_map else 'NONE'}\n"
+                f"Example Morph key: {next(iter(morph_map.keys())) if morph_map else 'NONE'}\n"
+                f"Example Label key: {next(iter(labels_map.keys())) if labels_map else 'NONE'}\n"
+                "Tip: If your labels slide_id column has no UUID part, it may only match sid.split('.')[0]."
+            )
+
+        self.items = items
+        self._missing_label = missing_label
+
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        it = self.items[idx]
+
+        feats, coords, h5_meta = load_h5_embedding(it.h5_path)  # feats: [N,D], coords: [N,2] or None
+
+        morph_X, morph_coords, morph_names = load_morph_csv(
+            it.morph_path,
+            drop_non_numeric=True,
+            keep_columns=self.keep_morph_columns,
+        )
+
+        # Normalize morph features to [0,1] BEFORE alignment
+        morph_X = minmax_01_np(morph_X)
+
+        # Align morph to ALL patches in H5 (missing patches -> zeros)
+        if self.align_by_coords_if_possible and (coords is not None) and (morph_coords is not None):
+            morph_aligned = align_morph_to_coords(
+                bag_coords=coords,        # ✅ coords from h5
+                morph_X=morph_X,
+                morph_coords=morph_coords,
+                fill_value=0.0,
+            )
+            morph_tensor = torch.from_numpy(morph_aligned)  # [N,K]
+            morph_is_aligned = True
         else:
-            self.label_to_id = {"low": 0, "mid": 1, "high": 2}
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, i):
-        path = self.files[i]
-        img = tifffile.imread(path)  # assume 2D grayscale
-        if img.ndim == 2:
-            img = img[None, ...]     # (1,H,W)
-        img = torch.from_numpy(img.astype(np.float32))
-
-        if self.transform:
-            img = self.transform(img)
-
-        # match by p-number from filename
-        pnum = str(int(extract_pnum_from_filename(path)))
-        tertile_str = self.p2tertile.get(pnum, None)
-
-        # guard: in case something slipped through
-        if tertile_str not in self.label_to_id:
-            # you can either raise, or mark as missing; raising is safer
-            raise KeyError(f"Label '{tertile_str}' for pnum={pnum} not in mapping {list(self.label_to_id.keys())}")
-
-        tertile_id = self.label_to_id[tertile_str]
+            morph_tensor = torch.from_numpy(morph_X)        # [M,K]
+            morph_is_aligned = False
 
         return {
-            "image": img,
-            "path": path,
-            "pnum": pnum,                   # e.g., '757'
-            "tertile_id": tertile_id,       # 0/1 if binarize=True
-            "tertile_str": tertile_str,     # 'low' or 'high'
+            "slide_id": it.slide_id,
+
+            # what your training loop uses
+            "feats": feats,
+            "label": it.label,
+
+            # extra info (kept, not necessarily used in training loop)
+            "coords": coords,
+            "morph": morph_tensor,
+            "morph_feature_names": morph_names,
+            "morph_aligned": morph_is_aligned,
+
+            "h5_meta": h5_meta,
+            "h5_path": str(it.h5_path),
+            "morph_path": str(it.morph_path),
         }
 
-# --- per-image min-max normalization to [0,1]
-class MinMax01(object):
-    def __call__(self, x):  # x: (C,H,W)
-        xmin = x.amin(dim=(1,2), keepdim=True)
-        xmax = x.amax(dim=(1,2), keepdim=True)
-        return (x - xmin) / (xmax - xmin).clamp(min=1e-6)
 
-from torch.utils.data import random_split, DataLoader
+import torch
+from typing import List, Dict, Any
 
-
-
-def get_loaders(
-    folder,
-    excel_path,
-    id_column="SampleID",
-    tertile_column="Tertile",
-    pattern="**/*DAPI*.tif",
-    val_ratio=0.2,
-    batch_size=1,
-    num_workers=1,
-    seed=42,
-):
+def clam_like_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Build train/val dataloaders for TIFF dataset with patchification.
+    MIL collate:
+    - batch_size==1: return tensors directly so training loop can do:
+        x = batch["feats"].to(device)
+        y = batch["label"].to(device)
+    - batch_size>1: return lists for variable-length bags.
     """
-    transform = T.Compose([
-        T.Resize((1024, 1024), interpolation=InterpolationMode.BILINEAR),
-        MinMax01(),
-        ReplicateTo3Channels(),    # make [1,H,W] → [3,H,W]
-        Patchify256(grid=None),   # 1024 -> 16 patches of 256x256
-        # OverlappedPatchify256(overlap=0.5),
-    ])
+    assert len(batch) >= 1
 
-    # Full dataset
-    ds = TiffDataset(
-        folder=folder,
-        excel_path=excel_path,
-        pattern=pattern,
-        id_column=id_column,
-        tertile_column=tertile_column,
-        transform=transform
+    if len(batch) == 1:
+        b = batch[0]
+        return {
+            "slide_id": b["slide_id"],
+            "feats": b["feats"],                         # Tensor [N,D]
+            "label": torch.tensor([b["label"]], dtype=torch.long),  # shape [1]
+
+            "coords": b.get("coords", None),             # Tensor [N,2] or None
+            "morph": b.get("morph", None),               # Tensor [N,K] or [M,K]
+            "morph_feature_names": b.get("morph_feature_names", []),
+            "morph_aligned": b.get("morph_aligned", False),
+
+            "h5_path": b.get("h5_path", None),
+            "morph_path": b.get("morph_path", None),
+            "h5_meta": b.get("h5_meta", None),
+        }
+
+    # batch_size > 1 (variable-length bags)
+    return {
+        "slide_id": [b["slide_id"] for b in batch],
+        "feats": [b["feats"] for b in batch],  # list of [Ni,D]
+        "label": torch.tensor([b["label"] for b in batch], dtype=torch.long),  # [B]
+
+        "coords": [b.get("coords", None) for b in batch],
+        "morph": [b.get("morph", None) for b in batch],
+        "morph_feature_names": batch[0].get("morph_feature_names", []) if len(batch) else [],
+        "morph_aligned": [b.get("morph_aligned", False) for b in batch],
+
+        "h5_path": [b.get("h5_path", None) for b in batch],
+        "morph_path": [b.get("morph_path", None) for b in batch],
+        "h5_meta": [b.get("h5_meta", None) for b in batch],
+    }
+
+
+
+###########################################################################################
+###########################################################################################
+###########################################################################################
+###########################################################################################
+###########################################################################################
+
+
+
+def train_val_loaders(
+    h5_dir: str,
+    morph_dir: str,
+    labels_csv: str,
+    *,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+    batch_size: int = 1,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    shuffle_train: bool = True,
+    shuffle_val: bool = False,
+    keep_morph_columns=None,
+    align_by_coords_if_possible: bool = True,
+    strict: bool = True,
+) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
+    """
+    Returns: train_loader, val_loader, info_dict
+    Splits at slide level (items) using random permutation.
+    """
+
+    ds = BRCAEmbedMorphDataset(
+        h5_dir=h5_dir,
+        morph_dir=morph_dir,
+        labels_csv=labels_csv,
+        slide_id_col="slide_id",
+        label_col="label",
+        keep_morph_columns=keep_morph_columns,
+        align_by_coords_if_possible=align_by_coords_if_possible,
+        strict=strict,
     )
 
-    ################################################# Split
-    # n_total = len(ds)
-    # n_val = int(val_ratio * n_total)
-    # n_train = n_total - n_val
-    # train_ds, val_ds = random_split(
-    #     ds,
-    #     [n_train, n_val],
-    #     generator=torch.Generator().manual_seed(seed)
-    # )
-# --- grouped split: keep all samples from the same tumor ID in the same split ---
-# --- grouped split by tumor ID token like "p275R" (case-insensitive) ---
+    n = len(ds)
+    if n == 0:
+        raise RuntimeError("Dataset is empty after matching. Check ID formats / paths.")
+    if not (0.0 < val_ratio < 1.0):
+        raise ValueError("val_ratio must be in (0,1)")
 
-    ################################################# Split
-    def _tumor_id_from_path(p: str) -> str:
-        """
-        Extracts tumor ID token like p275R / P0203 from filename.
-        Matches: p + digits + optional trailing letters (e.g., R).
-        Examples:
-        A1819-p275R-03_DAPI.tif           -> p275R
-        A1819-P0203-4MGLTumor-1_DAPI.tif  -> P0203
-        """
-        stem = Path(p).stem
-        m = re.search(r'(?i)\b(p\d+[a-z]*)\b', stem)   # case-insensitive
-        return m.group(1) if m else stem               # fallback if pattern missing
+    rng = np.random.RandomState(seed)
+    indices = np.arange(n)
+    rng.shuffle(indices)
 
-    # Build groups (may touch ds[i], but only uses 'path')
-    group_to_idxs = defaultdict(list)
-    for i in range(len(ds)):
-        sample = ds[i]
-        gid = _tumor_id_from_path(sample["path"])
-        group_to_idxs[gid].append(i)
-        sample = None  # drop ref to big tensors, if any
+    n_val = max(1, int(round(n * val_ratio)))
+    val_idx = indices[:n_val].tolist()
+    train_idx = indices[n_val:].tolist()
+    if len(train_idx) == 0:
+        # if dataset is tiny, ensure at least 1 train sample
+        train_idx = val_idx[:-1]
+        val_idx = val_idx[-1:]
 
-    groups = list(group_to_idxs.keys())
+    train_ds = Subset(ds, train_idx)
+    val_ds = Subset(ds, val_idx)
 
-    # Deterministic shuffle
-    rng = random.Random(seed)
-    rng.shuffle(groups)
-
-    # Target sizes
-    n_total = len(ds)
-    n_val   = int(round(val_ratio * n_total))
-
-    # Greedy assign whole groups to approach target val size
-    val_groups, train_groups = [], []
-    val_count = 0
-    for g in groups:
-        gsz = len(group_to_idxs[g])
-        if abs((val_count + gsz) - n_val) <= abs(val_count - n_val):
-            val_groups.append(g); val_count += gsz
-        else:
-            train_groups.append(g)
-
-    # Indices per split
-    val_indices   = [i for g in val_groups   for i in group_to_idxs[g]]
-    train_indices = [i for g in train_groups for i in group_to_idxs[g]]
-
-    train_ds = Subset(ds, train_indices)
-    val_ds   = Subset(ds, val_indices)
-
-    print(f"[split] train={len(train_ds)}  val={len(val_ds)}  "
-        f"groups: train={len(train_groups)} val={len(val_groups)}")
-
-
-
-    # DataLoaders
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle_train,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_patches_as_batch,
+        pin_memory=pin_memory,
+        collate_fn=clam_like_collate,
+        drop_last=False,
     )
 
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=shuffle_val,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_patches_as_batch,
+        pin_memory=pin_memory,
+        collate_fn=clam_like_collate,
+        drop_last=False,
     )
 
-    return train_loader, val_loader
+    # helpful stats
+    def _count_labels(subset: Subset) -> Dict[int, int]:
+        counts: Dict[int, int] = {}
+        for i in subset.indices:
+            y = ds.items[i].label
+            counts[y] = counts.get(y, 0) + 1
+        return counts
+
+    info = {
+        "n_total": n,
+        "n_train": len(train_idx),
+        "n_val": len(val_idx),
+        "label_to_int": getattr(ds, "label_to_int", None),
+        "int_to_label": getattr(ds, "int_to_label", None),
+        "train_label_counts": _count_labels(train_ds),
+        "val_label_counts": _count_labels(val_ds),
+    }
+
+    return train_loader, val_loader, info
 
 
-
-
+# ---------------- EXAMPLE USAGE ----------------
 if __name__ == "__main__":
-    train_loader, val_loader = get_loaders(
-        folder="/home/sshabani/projects/balt_experiment/data/BAlt_Expirement",
-        excel_path="/home/sshabani/projects/balt_experiment/data/BAlt_Expirement/bAlt_scores_complete.xlsx",
+    h5_dir = "/home/sshabani/projects/CLAM/data_BRCA/data_BRCA_regression/encoded_uni_no_normalization/h5_files"
+    morph_dir = "/home/sshabani/projects/CLAM/data_BRCA/test_resolution/encoded_morphs_csv"
+    labels_csv = "/home/sshabani/projects/CLAM/data_BRCA/preprocess/slides_with_labels_IDC_ILC_with_mag.csv"
+
+    train_loader, val_loader, info = train_val_loaders(
+        h5_dir=h5_dir,
+        morph_dir=morph_dir,
+        labels_csv=labels_csv,
         val_ratio=0.2,
+        seed=42,
         batch_size=1,
-        num_workers=1
+        num_workers=4,
+        pin_memory=True,
     )
 
-    # Example: one batch from train
+    print("Split info:", info)
     batch = next(iter(train_loader))
-    print("Train batch:", batch["image"].shape, batch["tertile_id"].shape, ) # batch["path"][:2]
-
-    ## save the patches 
-    save_batch_patches(batch, out_dir="/home/sshabani/projects/balt_experiment/output/test_loader")  # saves PNGs here
-    
-    # Example: one batch from val
-    batch_val = next(iter(val_loader))
-    print("Val batch:", batch_val["image"].shape, batch_val["tertile_id"].shape, ) #batch_val["path"][:2]
+    print("train batch slide:", batch["slide_id"], "label:", batch["label"][0].item())

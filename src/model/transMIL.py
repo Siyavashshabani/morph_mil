@@ -141,7 +141,7 @@ class TransMIL(nn.Module):
         elif cfg["ppeg"]=="addaptive":
             self.pos_layer = AddapPPEG(dim=self.emd_dim, mix_channels=False )
             
-        self._fc1 = nn.Sequential(nn.Linear(2048, self.emd_dim), nn.ReLU())
+        self._fc1 = nn.Sequential(nn.Linear(1024, self.emd_dim), nn.ReLU())
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.emd_dim))
         self.n_classes = n_classes
         self.layer1 = TransLayer(cfg, dim=self.emd_dim )
@@ -159,8 +159,8 @@ class TransMIL(nn.Module):
     def forward(self, **kwargs):
         
         h = kwargs['data'].float() #[B, n, 1024]
-        print("h------------------------------------shape:", h.shape)
-        exit()
+        # print("h------------------------------------shape:", h.shape)
+        # exit()
         h = self._fc1(h) #[B, n, 512]
         # print("after fc1-----------------------", h.shape)
         #---->pad

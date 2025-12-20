@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataloader.dataloaderResPt import get_feature_loaders 
+from dataloader.dataloader import train_val_loaders 
 # from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 import numpy as np, os
@@ -43,8 +43,8 @@ from torch.utils.tensorboard import SummaryWriter
 # import timm
 from model.transMIL import TransMIL
 from model.poolMIL import PoolMIL
-
 from model.utils import build_scheduler, build_loss
+
 
 def _to_numpy(a):
     import torch
@@ -69,11 +69,7 @@ def _maybe_softmax(probs_like):
         return _to_numpy(pt)
     return _to_numpy(pt)
 
-import numpy as np
-from sklearn.metrics import roc_auc_score, average_precision_score
 
-import numpy as np
-from sklearn.metrics import roc_auc_score, average_precision_score
 
 def _sigmoid(x):
     x = np.clip(x, -40, 40)
@@ -91,7 +87,7 @@ def compute_binary_auc_and_ap(y_true, y_prob_or_logits):
       y_prob_or_logits: (N,), (N,1), or (N,2); logits or probabilities; torch/np/list OK
     Returns: (roc_auc or None, pr_auc or None, y_score)   # y_score is pos-class prob in [0,1]
     """
-    print("y_true, y_prob_or_logits---------------", y_true.shape, y_prob_or_logits.shape)
+    # print("y_true, y_prob_or_logits---------------", y_true.shape, y_prob_or_logits.shape)
     # ---- normalize inputs
     try:
         import torch
@@ -223,9 +219,6 @@ def build_backbone(cfg):
         device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
         model = PoolMIL(cfg= cfg, n_classes = n_classes).to(device)
         return model
-
-
-
     return model
 
 def _unpack_out(out):
@@ -240,13 +233,16 @@ class Trainer:
         set_seed(cfg.get("seed", 42))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Data
-        self.train_loader, self.val_loader = get_feature_loaders(
-            root=cfg.get("data_path"),
-            label_from="tertile_id",
-            map_labels={"low":0,"mid":1,"high":2},
-            batch_size=cfg.get("batch_size", 10),
-            num_workers=cfg.get("num_workers", 4),
+        # Data     
+        self.train_loader, self.val_loader, info = train_val_loaders(
+            h5_dir=cfg.get("h5_dir"),
+            morph_dir=cfg.get("morph_dir"),
+            labels_csv=cfg.get("labels_csv"),
+            val_ratio=0.2,
+            seed=42,
+            batch_size=1,
+            num_workers=4,
+            pin_memory=True,
         )
 
         # Model / Optim / Loss
@@ -261,7 +257,8 @@ class Trainer:
         self.scheduler, self._sched_mode = build_scheduler(self.optimizer, self.train_loader, cfg)
         
         ## define the lossfunction
-        self.loss_fn = nn.CrossEntropyLoss()
+        weights = torch.tensor([1.0, 61/9], device=self.device )  # use your train counts
+        self.loss_fn = nn.CrossEntropyLoss(weight=weights )
 
         # AMP
         self.use_amp = bool(cfg.get("amp", True)) and torch.cuda.is_available()
@@ -305,7 +302,7 @@ class Trainer:
         self.model.eval()
         y_true, y_pred, y_prob = [], [], []
         for batch in loader:
-            x = batch["feats"].to(self.device, non_blocking=True)
+            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
             y = batch["label"].to(self.device, non_blocking=True)
 
             if self.use_amp:
@@ -417,7 +414,7 @@ class Trainer:
         running_loss, n_correct, n_total = 0.0, 0, 0
 
         for step, batch in enumerate(self.train_loader, 1):
-            x = batch["feats"].to(self.device, non_blocking=True)   # (B,16,2048)
+            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)   # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)   # (B,)
             i = 0
 
@@ -425,10 +422,11 @@ class Trainer:
             with autocast():
                 out = self.model(data=x)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
-                print("logits------------------------", logits.shape, logits)
-                print("yhat--------------------------", yhat.shape, yhat)
-                print("yprob-------------------------", yprob.shape, yprob)
-                exit()
+                # print("logits------------------------", logits.shape)
+                # print("yhat--------------------------", yhat.shape, yhat)
+                # print("yprob-------------------------", yprob.shape, yprob)
+                # print("y-----------------------------", y.shape)
+                # exit()
                 loss = self.loss_fn(logits, y)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -474,7 +472,7 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                x = batch["feats"].to(self.device, non_blocking=True)
+                x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
                 y = batch["label"].to(self.device, non_blocking=True)
 
                 if self.use_amp:
@@ -568,12 +566,13 @@ class Trainer:
     def forward_all(self, ckpt_path: str = None, max_batches: int = None):
         if ckpt_path is not None and os.path.isfile(ckpt_path):
             self.load_ckpt(ckpt_path)
-
+        print("start the forward_all -------------------------")
         self.model.eval()
         seen = 0
         for split, loader in [("val", self.val_loader)]:
             for batch in loader:
-                x = batch["feats"].to(self.device, non_blocking=True)
+                x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
+                # print("x-------------------------------------", x.shape)
                 logits = self.model(data=x)
                 print(f"{split} batch logits shape:", logits["logits"].shape)
                 seen += 1
@@ -591,7 +590,7 @@ def main():
 
     # quick check one batch
     trainer.forward_all(ckpt_path=None, max_batches=1)
-
+    # print("trainer.forward_all-------------------------pass")
     # full training        
     trainer.fit()
     

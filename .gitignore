@@ -6,3 +6,4 @@ pretrained_weights/
 resutls/
 runs/
 *.deb
+*.pyc

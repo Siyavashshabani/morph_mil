@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataloader.dataloader import get_loaders 
+# from dataloader.dataloader import get_loaders 
 # from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import numpy as np
 import numpy as np
