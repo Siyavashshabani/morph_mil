@@ -135,13 +135,14 @@ class TransMIL(nn.Module):
     def __init__(self, cfg, n_classes):
         super(TransMIL, self).__init__()
         self.emd_dim = cfg.get("emd_dim", 512)
+        self.input_dim = cfg.get("input_dim", 1024)
         
         if cfg["ppeg"]=="norm":
             self.pos_layer = PPEG(dim=self.emd_dim)
         elif cfg["ppeg"]=="addaptive":
             self.pos_layer = AddapPPEG(dim=self.emd_dim, mix_channels=False )
             
-        self._fc1 = nn.Sequential(nn.Linear(1024, self.emd_dim), nn.ReLU())
+        self._fc1 = nn.Sequential(nn.Linear(self.input_dim, self.emd_dim), nn.ReLU())
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.emd_dim))
         self.n_classes = n_classes
         self.layer1 = TransLayer(cfg, dim=self.emd_dim )

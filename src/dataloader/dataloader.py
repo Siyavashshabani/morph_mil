@@ -11,7 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 import h5py
 from dataclasses import dataclass
 from pathlib import Path
-
+from torch.utils.data import WeightedRandomSampler
+import torch
+import numpy as np
 
 def minmax_01_np(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """
@@ -419,7 +421,7 @@ def train_val_loaders(
     morph_dir: str,
     labels_csv: str,
     *,
-    val_ratio: float = 0.2,
+    val_ratio: float = 0.3,
     seed: int = 42,
     batch_size: int = 1,
     num_workers: int = 4,
@@ -429,6 +431,7 @@ def train_val_loaders(
     keep_morph_columns=None,
     align_by_coords_if_possible: bool = True,
     strict: bool = True,
+    use_weighted_sampler: bool = True, 
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """
     Returns: train_loader, val_loader, info_dict
@@ -445,7 +448,7 @@ def train_val_loaders(
         align_by_coords_if_possible=align_by_coords_if_possible,
         strict=strict,
     )
-
+    
     n = len(ds)
     if n == 0:
         raise RuntimeError("Dataset is empty after matching. Check ID formats / paths.")
@@ -467,15 +470,54 @@ def train_val_loaders(
     train_ds = Subset(ds, train_idx)
     val_ds = Subset(ds, val_idx)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=shuffle_train,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=clam_like_collate,
-        drop_last=False,
-    )
+    # train_loader = DataLoader(
+    #     train_ds,
+    #     batch_size=batch_size,
+    #     shuffle=shuffle_train,
+    #     num_workers=num_workers,
+    #     pin_memory=pin_memory,
+    #     collate_fn=clam_like_collate,
+    #     drop_last=False,
+    # )
+    # ---- class-weighted sampling for TRAIN only ----
+    if use_weighted_sampler:
+        # train_ds is a Subset, train_ds.indices are indices into ds.items
+        train_labels = np.array([ds.items[i].label for i in train_ds.indices], dtype=np.int64)
+
+        class_counts = np.bincount(train_labels, minlength=2)  # [count0, count1]
+        # inverse-frequency weights (common choice)
+        class_weights = 1.0 / np.maximum(class_counts, 1)
+
+        sample_weights = class_weights[train_labels]  # one weight per training sample
+
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),   # samples per epoch
+            replacement=True,                  # oversample minority
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,       # ✅ use sampler instead of shuffle
+            shuffle=False,         # must be False when sampler is set
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=clam_like_collate,
+            drop_last=False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=shuffle_train,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=clam_like_collate,
+            drop_last=False,
+        )
+
+
 
     val_loader = DataLoader(
         val_ds,

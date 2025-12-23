@@ -243,9 +243,18 @@ class Trainer:
             batch_size=1,
             num_workers=4,
             pin_memory=True,
+            use_weighted_sampler= False, #True
         )
 
         # Model / Optim / Loss
+        base_dim = self.cfg.get("base_input_dim", 1024)
+        morph_dim = self.cfg.get("morph_dim", 246)
+        
+        if self.cfg.get("simple_concat", False):
+            self.cfg["input_dim"] = base_dim + morph_dim
+        else:
+            self.cfg["input_dim"] = base_dim        
+                    
         self.model = build_backbone(cfg).to(self.device)
 
         ## define the optimizer
@@ -304,7 +313,12 @@ class Trainer:
         for batch in loader:
             x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
             y = batch["label"].to(self.device, non_blocking=True)
-
+            
+            ###### merge the feats and morphs
+            if self.cfg.get("simple_concat"):
+                morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
+                x = torch.cat([x, morph], dim=-1)
+                
             if self.use_amp:
                 with autocast():
                     out = self.model(data=x)
@@ -416,6 +430,15 @@ class Trainer:
         for step, batch in enumerate(self.train_loader, 1):
             x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)   # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)   # (B,)
+
+            if self.cfg.get("simple_concat"):
+                morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
+                x = torch.cat([x, morph], dim=-1)
+                # print("x----------------shape", x.shape)
+                # print("morph------------shape", morph.shape)
+
+            # print("x--------------shape", x.shape)
+            # exit()
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -474,7 +497,10 @@ class Trainer:
             for batch in self.val_loader:
                 x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
                 y = batch["label"].to(self.device, non_blocking=True)
-
+                if self.cfg.get("simple_concat"):
+                    morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
+                    x = torch.cat([x, morph], dim=-1)
+                    
                 if self.use_amp:
                     with autocast():
                         out = self.model(data=x)
@@ -589,7 +615,7 @@ def main():
     trainer = Trainer(cfg)
 
     # quick check one batch
-    trainer.forward_all(ckpt_path=None, max_batches=1)
+    # trainer.forward_all(ckpt_path=None, max_batches=1)
     # print("trainer.forward_all-------------------------pass")
     # full training        
     trainer.fit()
