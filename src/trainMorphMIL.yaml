@@ -20,9 +20,11 @@ wd: 5e-3
 scheduler: plateau
 
 ## model
-backbone: TransMIL #TransMIL
+backbone: MorphMIL #TransMIL
 pool: mean_median #max #max   attn
 emd_dim: 1024
+input_dim: 2048
+input_morph_dim: 246
 trans: nystrom #mamba #att #nystrom att
 ppeg: norm #addaptive #norm
 

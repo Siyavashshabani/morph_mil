@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from nystrom_attention import NystromAttention
-
+from .adaptorMorph import AdaptorViT
 # --- Mamba wrapper (expects x: [B, N, D]) ---
 try:
     from mamba_ssm import Mamba
@@ -131,11 +131,11 @@ class PPEG(nn.Module):
         return x
 
 
-class TransMIL(nn.Module):
+class MorphMIL(nn.Module):
     def __init__(self, cfg, n_classes):
-        super(TransMIL, self).__init__()
-        self.emd_dim = cfg.get("emd_dim", 512)
-        self.input_dim = cfg.get("input_dim", 1024)
+        super(MorphMIL, self).__init__()
+        self.emd_dim = cfg.get("emd_dim")
+        self.input_dim = cfg.get("input_dim" )
 
         ## define the gpu ids
         gpu_id = cfg.get("cuda", 0)
@@ -162,54 +162,50 @@ class TransMIL(nn.Module):
         self._fc3 = nn.Linear(self.emd_dim, self.n_classes)
         self.dropout = nn.Dropout(p=0.2)          # try 0.2–0.5
 
-
-    def forward(self, **kwargs):
         
-        h = kwargs['data'].float() #[B, n, 1024]
-        # print("h------------------------------------shape:", h.shape)
-        # exit()
+        ############################### AdaptorMorph is here
+        self.adaptor_morph = AdaptorViT(cfg)
+
+    def forward(self, data, morph):
+        
+        h = data.float() #[B, n, 1024]
+        # print("input of h ---------------------", h.shape)
+        h_morph = morph.float()
+        
+        ################################# Morph is here:
+        # print("input of h_morph ---------------------", h_morph.shape)
+        h_morph = self.adaptor_morph(h_morph)
+        # print("output of h_morph ---------------------", h_morph.shape)
+
+        ################################# How to concate the feats and morph
+        h = torch.cat((h,h_morph),dim=2)
+        # print("output of concate ---------------------", h.shape)
+
+        ################################# base MIL
         h = self._fc1(h) #[B, n, 512]
-        # print("after fc1-----------------------", h.shape)
-        #---->pad
         H = h.shape[1]
-        # print("H shape---------------------------------------", H)
         _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
         add_length = _H * _W - H
         h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
-
-        # print("1) Squaring of sequence;-----------------------", h.shape)
         
         #---->cls_token
         B = h.shape[0]
         cls_tokens = self.cls_token.expand(B, -1, -1).to(self.device)
         h = torch.cat((cls_tokens, h), dim=1)
 
-        # print("after adding the token-----------------------", h.shape)
-
         #---->Translayer x1
         h = self.layer1(h) #[B, N, 512]
-        # h = self.layer11(h)
-        # print("after Translayer x1:-----------------------", h.shape)
-        # print("_H, _W:------------------------------------", _H, _W)
         
         #---->PPEG
         h = self.pos_layer(h, _H, _W) #[B, N, 512]
-        # print("after PPEG-----------------------", h.shape)
         
         #---->Translayer x2
         h = self.layer2(h) #[B, N, 512]
-        # h = self.layer22(h) #[B, N, 512]
 
-        # print("after Translayer x2-----------------------", h.shape)
-        # exit()
         #---->cls_token
         h = self.norm(h)[:,0]
 
-        # ----> predict
-        # h = self._fc2(h)
         logits = self._fc3(h)              # [B, n_classes]
-        # h = F.relu(h, inplace=True)        # keep if you use a nonlinearity
-        # h = self.dropout(h)                # <-- dropout here
         
         Y_hat = torch.argmax(logits, dim=1)
         Y_prob = F.softmax(logits, dim = 1)
@@ -218,17 +214,20 @@ class TransMIL(nn.Module):
 
 if __name__ == "__main__":
     cfg = {
-        "emd_dim": 512,
+        "emd_dim": 1024,
         "input_dim": 2048,   # matches your data's last dim
-        "cuda": 0,           # GPU id
+        "input_morph_dim": 243,
+        "cuda": 1,           # GPU id
         "ppeg": "norm",      # or "addaptive"
     }
 
     device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
 
-    data = torch.randn((1, 16, 2048), device=device)
+    input_ = {}
+    input_["data"] = torch.randn((1, 16, 1024), device=device)
+    input_["morph"] = torch.randn((1, 16, 243), device=device)
 
-    model = TransMIL(cfg=cfg, n_classes=2).to(device)
+    model = MorphMIL(cfg=cfg, n_classes=2).to(device)
 
-    results_dict = model(data=data)
+    results_dict = model(data=input_["data"], morph=input_["morph"])
     print(results_dict)

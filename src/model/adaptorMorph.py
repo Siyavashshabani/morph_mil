@@ -131,104 +131,51 @@ class PPEG(nn.Module):
         return x
 
 
-class TransMIL(nn.Module):
-    def __init__(self, cfg, n_classes):
-        super(TransMIL, self).__init__()
+class AdaptorViT(nn.Module):
+    def __init__(self, cfg ):
+        super(AdaptorViT, self).__init__()
         self.emd_dim = cfg.get("emd_dim", 512)
-        self.input_dim = cfg.get("input_dim", 1024)
+        self.input_dim = cfg.get("input_morph_dim", 1024)
 
         ## define the gpu ids
         gpu_id = cfg.get("cuda", 0)
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{gpu_id}")
 
-
-        if cfg["ppeg"]=="norm":
-            self.pos_layer = PPEG(dim=self.emd_dim)
-        elif cfg["ppeg"]=="addaptive":
-            self.pos_layer = AddapPPEG(dim=self.emd_dim, mix_channels=False )
-            
         self._fc1 = nn.Sequential(nn.Linear(self.input_dim, self.emd_dim), nn.ReLU())
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.emd_dim))
-        self.n_classes = n_classes
         self.layer1 = TransLayer(cfg, dim=self.emd_dim )
-        # self.layer11 = TransLayer(cfg, dim=self.emd_dim )
-
         self.layer2 = TransLayer(cfg, dim=self.emd_dim )
-        # self.layer22 = TransLayer(cfg, dim=self.emd_dim )
-
-        self.norm = nn.LayerNorm(self.emd_dim)
-        # self._fc2 = nn.Linear(1024, 512)
-        self._fc3 = nn.Linear(self.emd_dim, self.n_classes)
-        self.dropout = nn.Dropout(p=0.2)          # try 0.2–0.5
 
 
-    def forward(self, **kwargs):
+    def forward(self, data):
         
-        h = kwargs['data'].float() #[B, n, 1024]
-        # print("h------------------------------------shape:", h.shape)
-        # exit()
+        h = data.float() #[B, n, 1024]
+
         h = self._fc1(h) #[B, n, 512]
-        # print("after fc1-----------------------", h.shape)
-        #---->pad
-        H = h.shape[1]
-        # print("H shape---------------------------------------", H)
-        _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
-        add_length = _H * _W - H
-        h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
-
-        # print("1) Squaring of sequence;-----------------------", h.shape)
-        
-        #---->cls_token
-        B = h.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1).to(self.device)
-        h = torch.cat((cls_tokens, h), dim=1)
-
-        # print("after adding the token-----------------------", h.shape)
 
         #---->Translayer x1
         h = self.layer1(h) #[B, N, 512]
-        # h = self.layer11(h)
-        # print("after Translayer x1:-----------------------", h.shape)
-        # print("_H, _W:------------------------------------", _H, _W)
-        
-        #---->PPEG
-        h = self.pos_layer(h, _H, _W) #[B, N, 512]
-        # print("after PPEG-----------------------", h.shape)
-        
+
         #---->Translayer x2
         h = self.layer2(h) #[B, N, 512]
-        # h = self.layer22(h) #[B, N, 512]
 
-        # print("after Translayer x2-----------------------", h.shape)
-        # exit()
-        #---->cls_token
-        h = self.norm(h)[:,0]
 
-        # ----> predict
-        # h = self._fc2(h)
-        logits = self._fc3(h)              # [B, n_classes]
-        # h = F.relu(h, inplace=True)        # keep if you use a nonlinearity
-        # h = self.dropout(h)                # <-- dropout here
-        
-        Y_hat = torch.argmax(logits, dim=1)
-        Y_prob = F.softmax(logits, dim = 1)
-        results_dict = {'logits': logits, 'Y_prob': Y_prob, 'Y_hat': Y_hat}
-        return results_dict
-
+        return h 
+    
+    
 if __name__ == "__main__":
     cfg = {
-        "emd_dim": 512,
-        "input_dim": 2048,   # matches your data's last dim
-        "cuda": 0,           # GPU id
+        "emd_dim": 1024,
+        "input_morph_dim": 243,   # matches your data's last dim
+        "cuda": 1,           # GPU id
         "ppeg": "norm",      # or "addaptive"
     }
 
     device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
 
-    data = torch.randn((1, 16, 2048), device=device)
+    data = torch.randn((1, 16, 243), device=device)
 
-    model = TransMIL(cfg=cfg, n_classes=2).to(device)
+    model = AdaptorViT(cfg=cfg).to(device)
 
     results_dict = model(data=data)
-    print(results_dict)
+    print(results_dict.shape)

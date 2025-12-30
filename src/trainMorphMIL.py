@@ -41,7 +41,7 @@ from torch.utils.tensorboard import SummaryWriter
 # from xgboost import XGBClassifier
 # from sklearn.utils.class_weight import compute_sample_weight
 # import timm
-from model.transMIL import TransMIL
+from model.morphMIL import MorphMIL
 from model.poolMIL import PoolMIL
 from model.utils import build_scheduler, build_loss
 
@@ -210,16 +210,11 @@ def save_ckpt(state, path: str):
 def build_backbone(cfg):
     backbone = cfg.get("backbone")
     n_classes = cfg.get("n_classes")
-    if backbone == "TransMIL":
+    if backbone == "MorphMIL":
         device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
-        model = TransMIL(cfg= cfg, n_classes = n_classes).to(device)
+        model = MorphMIL(cfg= cfg, n_classes = n_classes).to(device)
         return model
 
-    if backbone == "poolMIL":
-        device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
-        model = PoolMIL(cfg= cfg, n_classes = n_classes).to(device)
-        return model
-    return model
 
 def _unpack_out(out):
     if isinstance(out, dict):
@@ -257,10 +252,10 @@ class Trainer:
         base_dim = self.cfg.get("base_input_dim", 1024)
         morph_dim = self.cfg.get("morph_dim", 246)
         
-        if self.cfg.get("simple_concat", False):
-            self.cfg["input_dim"] = base_dim + morph_dim
-        else:
-            self.cfg["input_dim"] = base_dim        
+        # if self.cfg.get("simple_concat", False):
+        #     self.cfg["input_dim"] = base_dim + morph_dim
+        # else:
+        #     self.cfg["input_dim"] = base_dim        
                     
         self.model = build_backbone(cfg).to(self.device)
 
@@ -320,17 +315,12 @@ class Trainer:
         for batch in loader:
             x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
             y = batch["label"].to(self.device, non_blocking=True)
-            
-            ###### merge the feats and morphs
-            if self.cfg.get("simple_concat"):
-                morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
-                x = torch.cat([x, morph], dim=-1)
-                
+            morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
             if self.use_amp:
                 with autocast():
-                    out = self.model(data=x)
+                    out = self.model(x, morph)
             else:
-                out = self.model(data=x)
+                out = self.model(x, morph)
 
             logits, yhat, yprob = self._unpack_out(out)  # your existing helper
             print("logits, yhat, yprob--------------", logits.shape, yhat.shape, yprob.shape)
@@ -437,20 +427,13 @@ class Trainer:
         for step, batch in enumerate(self.train_loader, 1):
             x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)   # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)   # (B,)
+            morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
 
-            if self.cfg.get("simple_concat"):
-                morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
-                x = torch.cat([x, morph], dim=-1)
-                # print("x----------------shape", x.shape)
-                # print("morph------------shape", morph.shape)
-
-            # print("x--------------shape", x.shape)
-            # exit()
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
             with autocast():
-                out = self.model(data=x)                        # dict or tensor
+                out = self.model(x, morph)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
                 # print("logits------------------------", logits.shape)
                 # print("yhat--------------------------", yhat.shape, yhat)
@@ -504,17 +487,15 @@ class Trainer:
             for batch in self.val_loader:
                 x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
                 y = batch["label"].to(self.device, non_blocking=True)
-                if self.cfg.get("simple_concat"):
-                    morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)
-                    x = torch.cat([x, morph], dim=-1)
-                    
+                morph = batch["morph"].to(self .device, non_blocking=True).unsqueeze(0)               
+
                 if self.use_amp:
                     with autocast():
-                        out = self.model(data=x)
+                        out = self.model(x, morph)
                         logits, yhat, yprob = self._unpack_out(out)
                         loss = self.loss_fn(logits, y)
                 else:
-                    out = self.model(data=x)
+                    out = self.model(x, morph)
                     logits, yhat, yprob = self._unpack_out(out)
                     loss = self.loss_fn(logits, y)
 
@@ -595,27 +576,13 @@ class Trainer:
         
         
         
-    # ---------- Forward-only (e.g., quick sanity) ----------
-    def forward_all(self, ckpt_path: str = None, max_batches: int = None):
-        if ckpt_path is not None and os.path.isfile(ckpt_path):
-            self.load_ckpt(ckpt_path)
-        print("start the forward_all -------------------------")
-        self.model.eval()
-        seen = 0
-        for split, loader in [("val", self.val_loader)]:
-            for batch in loader:
-                x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
-                # print("x-------------------------------------", x.shape)
-                logits = self.model(data=x)
-                print(f"{split} batch logits shape:", logits["logits"].shape)
-                seen += 1
-                if max_batches and seen >= max_batches:
-                    break
+
+
 
 
 # ---------- Main ----------
 def main():
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainTransMIL.yaml"))
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainMorphMIL.yaml"))
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
