@@ -31,21 +31,59 @@ import matplotlib.pyplot as plt
 import time
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
-# from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
-# from sklearn.preprocessing import StandardScaler, LabelEncoder
-# from sklearn.pipeline import Pipeline
-# from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, classification_report, confusion_matrix
-# from sklearn.linear_model import LogisticRegression
-# from sklearn.svm import SVC, LinearSVC
-# from sklearn.ensemble import RandomForestClassifier
-# from xgboost import XGBClassifier
-# from sklearn.utils.class_weight import compute_sample_weight
-# import timm
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+from torch.utils.data.distributed import DistributedSampler
 from model.morphMIL import MorphMIL
 from model.poolMIL import PoolMIL
 from model.utils import build_scheduler, build_loss
 
+######################################################################################
+######################################################################################
+def ddp_setup():
+    """
+    Returns: (is_ddp, rank, world_size, local_rank)
+    Works with: torchrun --nproc_per_node=...
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return True, rank, world_size, local_rank
+    return False, 0, 1, 0
 
+def ddp_cleanup():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+   
+   
+def save_ckpt(self, path, epoch, val_acc):
+    if not self._rank0:
+        return
+    model_state = self.model.module.state_dict() if isinstance(self.model, DDP) else self.model.state_dict()
+    torch.save({
+        "cfg": self.cfg,
+        "epoch": epoch,
+        "model": model_state,
+        "optimizer": self.optimizer.state_dict(),
+        "val_acc": val_acc,
+    }, path)
+
+def load_ckpt(self, path):
+    ckpt = torch.load(path, map_location=self.device)
+    target = self.model.module if isinstance(self.model, DDP) else self.model
+    target.load_state_dict(ckpt["model"], strict=True)
+    if "optimizer" in ckpt:
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt
+######################################################################################
+######################################################################################
+     
+        
+        
 def _to_numpy(a):
     import torch
     if isinstance(a, torch.Tensor):
@@ -211,9 +249,9 @@ def build_backbone(cfg):
     backbone = cfg.get("backbone")
     n_classes = cfg.get("n_classes")
     if backbone == "MorphMIL":
-        device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
-        model = MorphMIL(cfg= cfg, n_classes = n_classes).to(device)
+        model = MorphMIL(cfg=cfg, n_classes=n_classes)
         return model
+    raise ValueError(f"Unknown backbone: {backbone}")
 
 
 def _unpack_out(out):
@@ -225,17 +263,22 @@ def _unpack_out(out):
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
-        set_seed(cfg.get("seed", 42))
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        gpu_id = cfg.get("cuda", 0)
+        self.is_ddp = bool(cfg.get("is_ddp", False))
+        self.rank = int(cfg.get("rank", 0))
+        self.world_size = int(cfg.get("world_size", 1))
+        self.local_rank = int(cfg.get("local_rank", 0))
 
+        # Seed: make it rank-dependent so workers don't all sample identically
+        set_seed(cfg.get("seed", 42) + self.rank)
+
+        # Device MUST be local_rank in DDP
         if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{gpu_id}")
+            self.device = torch.device(f"cuda:{self.local_rank}")
         else:
             self.device = torch.device("cpu")
 
-        # Data     
+        # Data (keep your function)
         self.train_loader, self.val_loader, info = train_val_loaders(
             h5_dir=cfg.get("h5_dir"),
             morph_dir=cfg.get("morph_dir"),
@@ -245,51 +288,64 @@ class Trainer:
             batch_size=1,
             num_workers=4,
             pin_memory=True,
-            use_weighted_sampler= False, #True
+            use_weighted_sampler=False,
         )
 
-        # Model / Optim / Loss
-        base_dim = self.cfg.get("base_input_dim", 1024)
-        morph_dim = self.cfg.get("morph_dim", 246)
-        
-        # if self.cfg.get("simple_concat", False):
-        #     self.cfg["input_dim"] = base_dim + morph_dim
-        # else:
-        #     self.cfg["input_dim"] = base_dim        
-                    
+        # If DDP: replace train loader sampler with DistributedSampler
+        if self.is_ddp:
+            train_ds = self.train_loader.dataset
+            train_sampler = DistributedSampler(
+                train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True, drop_last=False
+            )
+            self.train_loader = DataLoader(
+                train_ds,
+                batch_size=self.train_loader.batch_size,
+                sampler=train_sampler,
+                num_workers=self.train_loader.num_workers,
+                pin_memory=self.train_loader.pin_memory,
+                drop_last=False,
+            )
+            # (Simplest) only rank0 runs val/test → keep val_loader as-is
+
+        # Model
         self.model = build_backbone(cfg).to(self.device)
 
-        ## define the optimizer
+        # Wrap in DDP (after .to(device))
+        if self.is_ddp:
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=bool(cfg.get("find_unused_parameters", False)),
+            )
+
+        # Optimizer / Scheduler / Loss (same as you had)
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=float(cfg.get("lr", 1e-3)),
             weight_decay=float(cfg.get("wd", 1e-4)),
         )
         self.scheduler, self._sched_mode = build_scheduler(self.optimizer, self.train_loader, cfg)
-        
-        ## define the lossfunction
-        weights = torch.tensor([1.0, 61/9], device=self.device )  # use your train counts
-        self.loss_fn = nn.CrossEntropyLoss(weight=weights )
 
-        # AMP
+        weights = torch.tensor([1.0, 61/9], device=self.device)
+        self.loss_fn = nn.CrossEntropyLoss(weight=weights)
+
         self.use_amp = bool(cfg.get("amp", True)) and torch.cuda.is_available()
         self.scaler = GradScaler(enabled=self.use_amp)
 
-        # Checkpoints
+        # Rank-0 only logging/checkpoints
+        self._rank0 = (not self.is_ddp) or (self.rank == 0)
+
         self.outdir = cfg.get("outdir", "checkpoints")
         os.makedirs(self.outdir, exist_ok=True)
         self.ckpt_best = os.path.join(self.outdir, "best.pt")
         self.ckpt_last = os.path.join(self.outdir, "last.pt")
         self.best_val_acc = -1.0
 
-        ## tensorboard 
         self.run_name = self.cfg.get("run_name", "exp")
-        self.tb_dir   = self.cfg.get("tb_dir", f"runs/{self.run_name}-{time.strftime('%Y%m%d-%H%M%S')}")
-        self._rank0   = (not dist.is_initialized()) or dist.get_rank() == 0
-        self.tb       = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
-
-        self.global_step = 0   # increments each train step
-
+        self.tb_dir = self.cfg.get("tb_dir", f"runs/{self.run_name}-{time.strftime('%Y%m%d-%H%M%S')}")
+        self.tb = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
+        self.global_step = 0
         print("TensorBoard dir------------------------------:", self.tb_dir)
 
     # ---------- Train one epoch ----------
@@ -317,7 +373,7 @@ class Trainer:
             y = batch["label"].to(self.device, non_blocking=True)
             morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
             if self.use_amp:
-                with autocast():
+                with autocast(enabled=self.use_amp):
                     out = self.model(x, morph)
             else:
                 out = self.model(x, morph)
@@ -395,12 +451,7 @@ class Trainer:
         elif self.cfg["backbone"]=="poolMIL":
             raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm.png")
             norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm_norm.png")
-
-        elif self.cfg["backbone"]=="MorphMIL":
-            raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm.png")
-            norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm_norm.png")
-           
-         
+            
         _save_cm_png(cm, class_names, raw_path,  normalize=False, title=f"{name} • Confusion Matrix")
         _save_cm_png(cm, class_names, norm_path, normalize=True,  title=f"{name} • Confusion Matrix (row-norm)")
         print(f"Saved confusion matrices to:\n  {raw_path}\n  {norm_path}")
@@ -426,6 +477,9 @@ class Trainer:
         return cm, report
     # ---------- Train one epoch ----------
     def train_one_epoch(self, epoch: int):
+        if self.is_ddp and isinstance(self.train_loader.sampler, DistributedSampler):
+            self.train_loader.sampler.set_epoch(epoch)
+            
         self.model.train()
         running_loss, n_correct, n_total = 0.0, 0, 0
 
@@ -437,7 +491,7 @@ class Trainer:
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast():
+            with autocast(enabled=self.use_amp):
                 out = self.model(x, morph)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
                 # print("logits------------------------", logits.shape)
@@ -495,7 +549,7 @@ class Trainer:
                 morph = batch["morph"].to(self .device, non_blocking=True).unsqueeze(0)               
 
                 if self.use_amp:
-                    with autocast():
+                    with autocast(enabled=self.use_amp):
                         out = self.model(x, morph)
                         logits, yhat, yprob = self._unpack_out(out)
                         loss = self.loss_fn(logits, y)
@@ -545,39 +599,74 @@ class Trainer:
 
     # ---------- Full fit ----------
     def fit(self):
-        if self.cfg["mode"]=="train": 
+        mode = self.cfg.get("mode", "train")
+
+        # -------------------------
+        # TRAIN
+        # -------------------------
+        if mode == "train":
             epochs = int(self.cfg.get("epochs", 20))
+
             for epoch in range(1, epochs + 1):
+                # everyone trains
                 tr_loss, tr_acc = self.train_one_epoch(epoch)
-                val_loss, val_acc, lr = self.validate(epoch)
 
-                print(f"Epoch {epoch:02d} | "
-                    f"train_loss={tr_loss:.4f} train_acc={tr_acc:.2f}% | "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}")
+                # rank0 validates / logs / checkpoints
+                if self._rank0:
+                    val_loss, val_acc, lr = self.validate(epoch)
 
-                # save last
-                self.save_ckpt(self.ckpt_last, epoch, val_acc)
+                    print(
+                        f"Epoch {epoch:02d} | "
+                        f"train_loss={tr_loss:.4f} train_acc={tr_acc:.2f}% | "
+                        f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}"
+                    )
 
-                # save best
-                if val_acc > self.best_val_acc:
-                    self.best_val_acc = val_acc
-                    self.save_ckpt(self.ckpt_best, epoch, val_acc)
-                    print(f"🔥 New best val_acc: {val_acc:.2f}% — saved to {self.ckpt_best}")
+                    # save last
+                    self.save_ckpt(self.ckpt_last, epoch, val_acc)
 
-            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
-            print("Loaded best checkpoint for final evaluation.")
-            self.test(loader=getattr(self, "test_loader", None), name="test")
+                    # save best
+                    if val_acc > self.best_val_acc:
+                        self.best_val_acc = val_acc
+                        self.save_ckpt(self.ckpt_best, epoch, val_acc)
+                        print(f"🔥 New best val_acc: {val_acc:.2f}% — saved to {self.ckpt_best}")
 
-            # ---- TensorBoard clean up
-            if self._rank0 and self.tb is not None:
-                self.tb.flush()
-                self.tb.close()
-        
-        elif self.cfg["mode"]=="test": 
-            print("self.ckpt_best-------------", self.ckpt_best)
-            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
-            print("Loaded best checkpoint for final evaluation.")
-            self.test(loader=getattr(self, "test_loader", None), name="test")
+                # keep all ranks in sync (so non-rank0 doesn't run ahead)
+                if self.is_ddp:
+                    dist.barrier()
+
+            # Final eval only on rank0
+            if self._rank0:
+                self.load_ckpt(self.ckpt_best)
+                print("Loaded best checkpoint for final evaluation.")
+                self.test(loader=getattr(self, "test_loader", None), name="test")
+
+                # TensorBoard clean up
+                if self.tb is not None:
+                    self.tb.flush()
+                    self.tb.close()
+
+            if self.is_ddp:
+                dist.barrier()
+
+            return
+
+        # -------------------------
+        # TEST ONLY
+        # -------------------------
+        elif mode == "test":
+            if self._rank0:
+                print("self.ckpt_best-------------", self.ckpt_best)
+                self.load_ckpt(self.ckpt_best)
+                print("Loaded best checkpoint for final evaluation.")
+                self.test(loader=getattr(self, "test_loader", None), name="test")
+
+            if self.is_ddp:
+                dist.barrier()
+
+            return
+
+        else:
+            raise ValueError(f"Unknown mode={mode}. Expected 'train' or 'test'.")
         
         
         
@@ -591,14 +680,16 @@ def main():
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
-    trainer = Trainer(cfg)
+    is_ddp, rank, world_size, local_rank = ddp_setup()
+    cfg["is_ddp"] = is_ddp
+    cfg["rank"] = rank
+    cfg["world_size"] = world_size
+    cfg["local_rank"] = local_rank
 
-    # quick check one batch
-    # trainer.forward_all(ckpt_path=None, max_batches=1)
-    # print("trainer.forward_all-------------------------pass")
-    # full training        
+    trainer = Trainer(cfg)
     trainer.fit()
-    
+
+    ddp_cleanup()
 
 if __name__ == "__main__":
     main()

@@ -134,7 +134,7 @@ class PPEG(nn.Module):
 class AdaptorViT(nn.Module):
     def __init__(self, cfg ):
         super(AdaptorViT, self).__init__()
-        self.emd_dim = cfg.get("emd_dim", 512)
+        self.emd_dim = cfg.get("emd_morph_dim", 512)
         self.input_dim = cfg.get("input_morph_dim", 1024)
 
         ## define the gpu ids
@@ -151,7 +151,7 @@ class AdaptorViT(nn.Module):
         
         h = data.float() #[B, n, 1024]
 
-        h = self._fc1(h) #[B, n, 512]
+        # h = self._fc1(h) #[B, n, 512]
 
         #---->Translayer x1
         h = self.layer1(h) #[B, N, 512]

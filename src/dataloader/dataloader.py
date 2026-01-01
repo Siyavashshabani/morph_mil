@@ -15,6 +15,15 @@ from torch.utils.data import WeightedRandomSampler
 import torch
 import numpy as np
 
+
+def h5_num_patches(h5_path: Path) -> int:
+    with h5py.File(str(h5_path), "r") as f:
+        if "features" in f:
+            return int(f["features"].shape[0])
+        if "feats" in f:
+            return int(f["feats"].shape[0])
+        raise KeyError(f"No 'features' or 'feats' dataset in {h5_path}. Keys: {list(f.keys())}")
+
 def minmax_01_np(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """
     Column-wise MinMax normalization to [0,1].
@@ -206,6 +215,7 @@ class BRCAEmbedMorphDataset(Dataset):
         keep_morph_columns: Optional[List[str]] = None,
         align_by_coords_if_possible: bool = True,
         strict: bool = True,
+        max_patches: int = 20000,   # <-- add this
     ):
         self.h5_dir = Path(h5_dir)
         self.morph_dir = Path(morph_dir)
@@ -307,6 +317,28 @@ class BRCAEmbedMorphDataset(Dataset):
             )
 
         self.items = items
+
+        # ---- drop slides with too many patches ----
+        if max_patches is not None:
+            kept: List[BRCAItem] = []
+            dropped: List[tuple[str, int]] = []
+
+            for it in items:
+                n = h5_num_patches(it.h5_path)  # cheap: reads only dataset shape
+                if n <= max_patches:
+                    kept.append(it)
+                else:
+                    dropped.append((it.slide_id, n))
+
+            if len(dropped) > 0:
+                print(f"[Dataset] Dropped {len(dropped)} slides with > {max_patches} patches.")
+                # show a few
+                for sid, n in dropped[:10]:
+                    print(f"  - {sid}: {n}")
+
+            items = kept        
+        
+        
         self._missing_label = missing_label
 
 

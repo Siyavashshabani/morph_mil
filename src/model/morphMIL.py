@@ -167,13 +167,13 @@ class MorphMIL(nn.Module):
         self.adaptor_morph = AdaptorViT(cfg)
 
     def forward(self, data, morph):
-        
+
+        ## define the inputs        
         h = data.float() #[B, n, 1024]
-        # print("input of h ---------------------", h.shape)
         h_morph = morph.float()
         
         ################################# Morph is here:
-        # print("input of h_morph ---------------------", h_morph.shape)
+        # print("input of h ----------------------------", h.shape)
         h_morph = self.adaptor_morph(h_morph)
         # print("output of h_morph ---------------------", h_morph.shape)
 
