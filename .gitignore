@@ -8,3 +8,6 @@ runs/
 pics/
 *.deb
 *.pyc
+# experiment logs
+experiments/
+
