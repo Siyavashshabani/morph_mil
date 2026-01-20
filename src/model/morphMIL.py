@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from nystrom_attention import NystromAttention
 from .adaptorMorph import AdaptorViT
+from .augment import TensorAugment
 # --- Mamba wrapper (expects x: [B, N, D]) ---
 try:
     from mamba_ssm import Mamba
@@ -137,6 +138,9 @@ class MorphMIL(nn.Module):
         self.emd_dim = cfg.get("emd_dim")
         self.input_dim = cfg.get("input_dim" )
 
+        ## what branch: 
+        self.model_branch = cfg.get("model_branch" )
+
         ## define the gpu ids
         gpu_id = cfg.get("cuda", 0)
         if torch.cuda.is_available():
@@ -162,9 +166,12 @@ class MorphMIL(nn.Module):
         self._fc3 = nn.Linear(self.emd_dim, self.n_classes)
         self.dropout = nn.Dropout(p=0.2)          # try 0.2–0.5
 
-        
+        ## 
+        self.cancat_type = cfg.get("cancat_type", "simple")
         ############################### AdaptorMorph is here
-        self.adaptor_morph = AdaptorViT(cfg)
+        if self.model_branch=="morph" or self.model_branch=="both":
+            self.adaptor_morph = AdaptorViT(cfg)
+
 
     def forward(self, data, morph):
 
@@ -172,44 +179,82 @@ class MorphMIL(nn.Module):
         h = data.float() #[B, n, 1024]
         h_morph = morph.float()
         
-        ################################# Morph is here:
-        # print("input of h ----------------------------", h.shape)
-        h_morph = self.adaptor_morph(h_morph)
+
         # print("output of h_morph ---------------------", h_morph.shape)
+        # exit()
 
-        ################################# How to concate the feats and morph
-        h = torch.cat((h,h_morph),dim=2)
-        # print("output of concate ---------------------", h.shape)
+        if self.model_branch=="morph":
+            ################################# Morph is here:
+            # print("input of h ----------------------------", h.shape)
+            h_morph = self.adaptor_morph(h_morph)
+            h = h_morph 
 
-        ################################# base MIL
-        h = self._fc1(h) #[B, n, 512]
-        H = h.shape[1]
-        _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
-        add_length = _H * _W - H
-        h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
-        
-        #---->cls_token
-        B = h.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1).to(self.device)
-        h = torch.cat((cls_tokens, h), dim=1)
+        elif self.model_branch=="image":      
+            ################################# base MIL
+            h = self._fc1(h) #[B, n, 512]
+            H = h.shape[1]
+            _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
+            add_length = _H * _W - H
+            h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
+            
+            #---->cls_token
+            B = h.shape[0]
+            cls_tokens = self.cls_token.expand(B, -1, -1).to(self.device)
+            h = torch.cat((cls_tokens, h), dim=1)
 
-        #---->Translayer x1
-        h = self.layer1(h) #[B, N, 512]
+            #---->Translayer x1
+            h = self.layer1(h) #[B, N, 512]
+            
+            #---->PPEG
+            h = self.pos_layer(h, _H, _W) #[B, N, 512]
+            
+            #---->Translayer x2
+            h = self.layer2(h) #[B, N, 512]
+
         
-        #---->PPEG
-        h = self.pos_layer(h, _H, _W) #[B, N, 512]
-        
-        #---->Translayer x2
-        h = self.layer2(h) #[B, N, 512]
+        elif self.model_branch=="both":   
+            h_morph = self.adaptor_morph(h_morph)
+            # print("h_morph-----------------", h_morph.shape )
+            # print("h-----------------------", h.shape )
+            ################################# How to concate the feats and morph
+            if self.cancat_type=="simple":
+                h = torch.cat((h,h_morph),dim=2)
+            elif self.cancat_type=="one_to_all":
+                h_morph = h_morph.repeat(h.size(0), 1, 1)            # [3, 7875, 246]
+                h = torch.cat([h, h_morph], dim=-1)            
+            # print("output of concate ---------------------", h.shape)
+            # exit()
+            
+            ################################# base MIL
+            h = self._fc1(h) #[B, n, 512]
+            H = h.shape[1]
+            _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
+            add_length = _H * _W - H
+            h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
+            
+            #---->cls_token
+            B = h.shape[0]
+            cls_tokens = self.cls_token.expand(B, -1, -1).to(self.device)
+            h = torch.cat((cls_tokens, h), dim=1)
+
+            #---->Translayer x1
+            h = self.layer1(h) #[B, N, 512]
+            
+            #---->PPEG
+            h = self.pos_layer(h, _H, _W) #[B, N, 512]
+            
+            #---->Translayer x2
+            h = self.layer2(h) #[B, N, 512]
 
         #---->cls_token
         h = self.norm(h)[:,0]
 
         logits = self._fc3(h)              # [B, n_classes]
-        
+        # print("in model logits---------", logits.shape)
         Y_hat = torch.argmax(logits, dim=1)
         Y_prob = F.softmax(logits, dim = 1)
         results_dict = {'logits': logits, 'Y_prob': Y_prob, 'Y_hat': Y_hat}
+        # print("Y_prob----------------------", Y_prob)
         return results_dict
 
 if __name__ == "__main__":

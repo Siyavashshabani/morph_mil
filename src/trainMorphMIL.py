@@ -246,6 +246,8 @@ class Trainer:
             num_workers=4,
             pin_memory=True,
             use_weighted_sampler= False, #True
+            aug_flag= cfg.get("aug_flag", True),
+
         )
 
         # Model / Optim / Loss

@@ -1,5 +1,5 @@
 ## define the cuda 
-cuda: 4
+cuda: 2
 
 
 ## data 
@@ -12,7 +12,7 @@ n_classes: 2
 ## training 
 mode: train #train #train #test
 batch_size: 1 
-epochs: 16 #3 #200
+epochs: 40 #16 #3 #200
 
 ##optimizer 
 lr: 5e-6 #4e-5
@@ -22,15 +22,27 @@ scheduler: plateau
 ## model
 backbone: MorphMIL #TransMIL
 pool: mean_median #max #max   attn
-emd_dim: 1024 #1024
+emd_dim: 512 #1024 #1024
 emd_morph_dim: 246 #1024
-input_dim: 1270 #1536 #2048
+input_dim: 1270 #1270 #1024 #1536 #2048
 input_morph_dim: 246
 trans: nystrom #mamba #att #nystrom att
 ppeg: norm #addaptive #norm
-
+aug_morph: False
 
 ## ways of fusion 
 simple_concat: True #False
 base_input_dim: 1024
 morph_dim: 246
+
+model_branch: both #both #image
+cancat_type: one_to_all #one_to_all #simple #one_to_all
+
+## loss 
+loss_type: ce_jsd #ce_con #ce #jsd #jsd #ce_jsd  #ce_con
+alpha_jsd: 40 #
+alpha_con: 0.1
+
+## augmetation for Jsd
+aug_flag: True #False
+aug_morph: False #True #False
