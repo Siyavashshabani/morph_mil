@@ -11,3 +11,8 @@ pics/
 # experiment logs
 experiments/
 
+
+# python cache
+__pycache__/
+*.pyc
+

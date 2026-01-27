@@ -184,6 +184,7 @@ class AdaptorViT(nn.Module):
         
         h = data.float() #[B, n, 1024]
 
+        # print("h.shape----------------------", h.shape)
         h = self._fc1(h) #[B, n, 512]
 
         #---->Translayer x1
@@ -201,6 +202,14 @@ class AdaptorViT(nn.Module):
             # print("h----------------------------------------", h.shape)
         return h 
     
+
+
+######################################################################### 
+######################################################################### Fourier Neural Operator(FNO)
+
+
+
+
     
 if __name__ == "__main__":
     cfg = {

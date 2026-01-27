@@ -170,8 +170,10 @@ class MorphMIL(nn.Module):
         self.cancat_type = cfg.get("cancat_type", "simple")
         ############################### AdaptorMorph is here
         if self.model_branch=="morph" or self.model_branch=="both":
-            self.adaptor_morph = AdaptorViT(cfg)
-
+            if cfg.get("adaptor")=="vit":
+                self.adaptor_morph = AdaptorViT(cfg)
+            elif cfg.get("adaptor")=="fno": 
+                self.adaptor_morph = AdaptorViT(cfg)
 
     def forward(self, data, morph):
 
