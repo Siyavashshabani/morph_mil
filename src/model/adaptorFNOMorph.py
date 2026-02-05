@@ -3,9 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.cuda.amp import autocast
 
-from fno.models.fno import FNO1d
-from augment import TensorAugment
+from .fno.models.fno import FNO1d
+from .augment import TensorAugment
 
 class AdaptorFNO(nn.Module):
     def __init__(self, cfg ):
@@ -14,9 +15,9 @@ class AdaptorFNO(nn.Module):
         self.input_dim = cfg.get("input_morph_dim", 1024)
         self.aug_flag = cfg.get("aug_morph", True)
         ## define the gpu ids
-        gpu_id = cfg.get("cuda", 0)
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{gpu_id}")
+        # gpu_id = cfg.get("cuda", 0)
+        # if torch.cuda.is_available():
+        #     self.device = torch.device(f"cuda:{gpu_id}")
         self.fno = FNO1d(
             n_modes_height=self.emd_dim,
             hidden_channels=self.emd_dim,
@@ -59,25 +60,25 @@ class AdaptorFNO(nn.Module):
             p_rect_cutout=0.20, rect_token_frac=0.25, rect_feat_frac=0.18
         )  
 
+
     def forward(self, data):
+        h = data.permute(0, 2, 1).contiguous()  # [B, F, N]
+
+        # Run FNO in FP32 to avoid cuFFT fp16 power-of-two restriction
+        with autocast(enabled=False):
+            h_out = self.fno(h.float())         # [B, 1, N] in fp32
+
+        h_out = h_out.permute(0, 2, 1).contiguous()  # [B, N, 1]
+
+        if self.aug_flag:
+            h_aug1 = self.aug(h_out.clone())
+            h_aug2 = self.aug_light(h_out.clone())
+            h_out = torch.stack([h_out.squeeze(0), 
+                                 h_aug1.squeeze(0), 
+                                 h_aug2.squeeze(0)], dim=0)
+
+        return h_out
         
-        h = data.float() #[B, n, 1024]
-        # Convert [B, N, F] -> [B, F, N] for FNO1d
-        h = h.permute(0, 2, 1).contiguous()
-
-        h = self.fno(h)   # expected: [B, out_channels, N]
-
-        # Convert back to tokens-first if you want: [B, N, out_channels]
-        h = h.permute(0, 2, 1).contiguous()
-        if self.aug_flag == True: 
-            # print("h.dtype------------------", h.dtype)
-            h_aug1 = self.aug(h.clone())
-            h_aug2 = self.aug_light(h.clone())
-            h = torch.stack([h, h_aug1, h_aug2], dim=0).squeeze(1)
-            # print("aug flag---------------------------------------------------")         
-            # print("h----------------------------------------", h.shape)
-        return h 
-    
 
 
 ######################################################################### 
@@ -89,16 +90,15 @@ class AdaptorFNO(nn.Module):
     
 if __name__ == "__main__":
     cfg = {
-        "emd_dim": 1024,
-        "emd_morph_dim": 512,
-        "input_morph_dim": 243,   # matches your data's last dim
+        "emd_morph_dim": 128,
+        "input_morph_dim": 246,   # matches your data's last dim
         "cuda": 1,           # GPU id
         "ppeg": "norm",      # or "addaptive"
     }
 
     device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
 
-    data = torch.randn((1, 10000, 243), device=device)
+    data = torch.randn((1, 3605, 246), device=device)
 
     model = AdaptorFNO(cfg=cfg).to(device)
 

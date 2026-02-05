@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 from nystrom_attention import NystromAttention
 from .adaptorMorph import AdaptorViT
+from .adaptorFNOMorph import AdaptorFNO
+
 from .augment import TensorAugment
 # --- Mamba wrapper (expects x: [B, N, D]) ---
 try:
@@ -137,6 +139,7 @@ class MorphMIL(nn.Module):
         super(MorphMIL, self).__init__()
         self.emd_dim = cfg.get("emd_dim")
         self.input_dim = cfg.get("input_dim" )
+        self.game_theory = cfg.get("game_theory", True )
 
         ## what branch: 
         self.model_branch = cfg.get("model_branch" )
@@ -173,26 +176,25 @@ class MorphMIL(nn.Module):
             if cfg.get("adaptor")=="vit":
                 self.adaptor_morph = AdaptorViT(cfg)
             elif cfg.get("adaptor")=="fno": 
-                self.adaptor_morph = AdaptorViT(cfg)
+                self.adaptor_morph = AdaptorFNO(cfg)
 
-    def forward(self, data, morph):
+    def forward(self, data, h_morph):
 
         ## define the inputs        
         h = data.float() #[B, n, 1024]
-        h_morph = morph.float()
         
-
         # print("output of h_morph ---------------------", h_morph.shape)
         # exit()
 
         if self.model_branch=="morph":
-            ################################# Morph is here:
+            h_morph = h_morph.float()        
             # print("input of h ----------------------------", h.shape)
             h_morph = self.adaptor_morph(h_morph)
             h = h_morph 
 
         elif self.model_branch=="image":      
             ################################# base MIL
+            # print("h--------------------------------------------", h.shape)
             h = self._fc1(h) #[B, n, 512]
             H = h.shape[1]
             _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
@@ -215,12 +217,19 @@ class MorphMIL(nn.Module):
 
         
         elif self.model_branch=="both":   
+            h_morph = h_morph.float()        
             h_morph = self.adaptor_morph(h_morph)
-            # print("h_morph-----------------", h_morph.shape )
-            # print("h-----------------------", h.shape )
+            
             ################################# How to concate the feats and morph
             if self.cancat_type=="simple":
-                h = torch.cat((h,h_morph),dim=2)
+                if self.game_theory:
+                    Z_M = torch.cat((h[0,:,:],h_morph[0,:,:]),dim=1).unsqueeze(0) 
+                    Zp_M = torch.cat((h[1,:,:],h_morph[0,:,:]),dim=1).unsqueeze(0) 
+                    Z_Mp = torch.cat((h[0,:,:],h_morph[1,:,:]),dim=1).unsqueeze(0) 
+                    h = torch.cat((Z_M, Zp_M, Z_Mp),dim=0 )    
+                else: 
+                    h = torch.cat((h,h_morph),dim=2)
+                    
             elif self.cancat_type=="one_to_all":
                 h_morph = h_morph.repeat(h.size(0), 1, 1)            # [3, 7875, 246]
                 h = torch.cat([h, h_morph], dim=-1)            

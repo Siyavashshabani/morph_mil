@@ -138,6 +138,8 @@ class AdaptorViT(nn.Module):
         self.emd_dim = cfg.get("emd_morph_dim", 512)
         self.input_dim = cfg.get("input_morph_dim", 1024)
         self.aug_flag = cfg.get("aug_morph", True)
+        self.game_theory = cfg.get("game_theory", False)
+        
         ## define the gpu ids
         gpu_id = cfg.get("cuda", 0)
         if torch.cuda.is_available():
@@ -194,12 +196,15 @@ class AdaptorViT(nn.Module):
         # h = self.layer2(h) #[B, N, 512]
 
         if self.aug_flag == True: 
-            # print("h.dtype------------------", h.dtype)
-            h_aug1 = self.aug(h.clone())
-            h_aug2 = self.aug_light(h.clone())
-            h = torch.stack([h, h_aug1, h_aug2], dim=0).squeeze(1)
-            # print("aug flag---------------------------------------------------")         
-            # print("h----------------------------------------", h.shape)
+            if self.game_theory:
+                h_aug1 = self.aug(h.clone())
+                h = torch.stack([h, h_aug1], dim=0).squeeze(1)
+                
+            else: 
+                h_aug1 = self.aug(h.clone())
+                h_aug2 = self.aug_light(h.clone())
+                h = torch.stack([h, h_aug1, h_aug2], dim=0).squeeze(1)
+
         return h 
     
 

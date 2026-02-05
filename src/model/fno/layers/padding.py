@@ -3,7 +3,9 @@ from typing import List, Union, Literal
 from torch import nn
 from torch.nn import functional as F
 
-from fno.utils import validate_scaling_factor
+# from fno.utils import validate_scaling_factor
+from ..utils import validate_scaling_factor
+
 
 class DomainPadding(nn.Module):
     """Applies domain padding scaled automatically to the input's resolution

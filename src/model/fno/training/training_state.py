@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from torch import nn
 import torch.distributed as dist
-from fno.mpu.comm import get_local_rank
+from ..mpu.comm import get_local_rank
 
 
 def load_training_state(save_dir: Union[str, Path], 

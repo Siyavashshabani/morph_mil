@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataloader.dataloader import train_val_loaders 
 # from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 import numpy as np, os
@@ -240,18 +239,38 @@ class Trainer:
         else:
             self.device = torch.device("cpu")
 
-        # Data     
-        self.train_loader, self.val_loader, info = train_val_loaders(
-            h5_dir=cfg.get("h5_dir"),
-            morph_dir=cfg.get("morph_dir"),
-            labels_csv=cfg.get("labels_csv"),
-            val_ratio=0.2,
-            seed=42,
-            batch_size=1,
-            num_workers=4,
-            pin_memory=True,
-            use_weighted_sampler= False, #True
-        )
+        # Data 
+        self.dataset = cfg.get("dataset")
+        if self.dataset=="brca":  
+            from dataloader.dataloader import train_val_loaders   
+            self.train_loader, self.val_loader, info = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                morph_dir=cfg.get("morph_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=4,
+                pin_memory=True,
+                use_weighted_sampler= False, #True
+                aug_flag=cfg.get("aug_flag")
+            )
+        elif self.dataset=="camelyon":
+            print("camelyon-----------------------------------------------")
+            from dataloader.dataloaderCamelyon import train_val_loaders 
+            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                morph_dir=cfg.get("morph_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=1,
+                pin_memory=True,
+                use_weighted_sampler= False, #True
+                aug_flag=cfg.get("aug_flag")
+            )
+
 
         # Model / Optim / Loss
         base_dim = self.cfg.get("base_input_dim", 1024)
@@ -359,7 +378,10 @@ class Trainer:
         p_clean = yprob[0:1]
         p_aug1  = yprob[1:2]
         p_aug2  = yprob[2:3]
-
+        
+        ## making ram free
+        del yprob
+        
         # -------------------------
         # CE (on clean) from probs
         # -------------------------
@@ -384,7 +406,7 @@ class Trainer:
         # We pool tokens -> [3, D] then -> [1, 3, D]
         # labels should be [bsz]=[1]
         # -------------------------
-        con = torch.tensor(0.0, device=yprob.device)
+        con = torch.tensor(0.0, device=self.device)
         if loss_type == "ce_con" or return_parts:
             if feats is None:
                 raise ValueError("feats is required for contrastive loss (ce_con).")
@@ -401,7 +423,7 @@ class Trainer:
             feats_view = F.normalize(feats_view, dim=-1)
             feats_sc = feats_view.unsqueeze(0)  # [1, 3, D]
 
-            con_loss_fn = SupConLoss(temperature=temperature, contrast_mode="all").to(yprob.device)
+            con_loss_fn = SupConLoss(temperature=temperature, contrast_mode="all").to(self.device)
             con = con_loss_fn(feats_sc, labels=target)
 
         # -------------------------
@@ -475,7 +497,7 @@ class Trainer:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_grad_enabled(False)
 
-        loader = loader or getattr(self, "test_loader", None) or self.val_loader
+        loader = loader or getattr(self, "test_loader", None) or self.test_loader
 
         # Expect these from your implementation
         y_true, y_pred, y_prob = self._predict_on_loader(loader)
@@ -558,7 +580,6 @@ class Trainer:
             # print("x.shape-----------------------", x.shape)
             target = batch["label"].to(self.device, non_blocking=True)  # (B,)
             morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
-
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -646,6 +667,9 @@ class Trainer:
                 preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
                 n_correct += (preds == target).sum().item()
                 n_total   += target.numel()
+                
+                ## make free the memory               
+                del out, logits, yhat, yprob, loss, x, target, morph, preds
 
         val_loss = running_loss / max(1, n_total)
         val_acc  = 100.0 * n_correct / max(1, n_total)
@@ -722,7 +746,7 @@ class Trainer:
 
 # ---------- Main ----------
 def main():
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainMorphMIL.yaml"))
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainJsdMorphMIL.yaml"))
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -733,7 +757,7 @@ def main():
     # print("trainer.forward_all-------------------------pass")
     # full training        
     trainer.fit()
-    
+    print(cfg)
 
 if __name__ == "__main__":
     main()

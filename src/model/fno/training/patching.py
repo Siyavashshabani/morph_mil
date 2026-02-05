@@ -3,8 +3,10 @@ import math
 import torch
 from torch import nn
 
-import fno.mpu.comm as comm
-from fno.mpu.mappings import (
+from ..mpu import comm
+
+# import fno.mpu.comm as comm
+from ..mpu.mappings import (
     gather_from_model_parallel_region,
     scatter_to_model_parallel_region,
 )

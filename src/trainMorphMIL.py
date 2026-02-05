@@ -235,21 +235,42 @@ class Trainer:
         else:
             self.device = torch.device("cpu")
 
-        # Data     
-        self.train_loader, self.val_loader, info = train_val_loaders(
-            h5_dir=cfg.get("h5_dir"),
-            morph_dir=cfg.get("morph_dir"),
-            labels_csv=cfg.get("labels_csv"),
-            val_ratio=0.2,
-            seed=42,
-            batch_size=1,
-            num_workers=4,
-            pin_memory=True,
-            use_weighted_sampler= False, #True
-            aug_flag= cfg.get("aug_flag", True),
-
-        )
-
+        # Data 
+        self.dataset = cfg.get("dataset")
+        if self.dataset=="brca":  
+            from dataloader.dataloader import train_val_loaders   
+            self.train_loader, self.val_loader, info = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                morph_dir=cfg.get("morph_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=4,
+                pin_memory=True,
+                use_weighted_sampler= False, #True
+                aug_flag=cfg.get("aug_flag")
+            )
+        elif self.dataset=="camelyon":
+            print("camelyon-----------------------------------------------")
+            from dataloader.dataloaderCamelyon import train_val_loaders 
+            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                morph_dir=cfg.get("morph_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=4,
+                pin_memory=True,
+                use_weighted_sampler= False, #True
+                aug_flag=cfg.get("aug_flag")
+            )
+        else:
+            raise ValueError(
+                f"Unknown dataset={self.dataset!r}. Expected one of: ['brca', 'camelyon']"
+            )
+        
         # Model / Optim / Loss
         base_dim = self.cfg.get("base_input_dim", 1024)
         morph_dim = self.cfg.get("morph_dim", 246)
@@ -600,6 +621,7 @@ def main():
     # print("trainer.forward_all-------------------------pass")
     # full training        
     trainer.fit()
+    print(cfg)
     
 
 if __name__ == "__main__":

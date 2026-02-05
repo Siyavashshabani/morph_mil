@@ -1,5 +1,6 @@
 import torch
-import fno.mpu.comm as comm
+# import ..mpu.comm as comm
+from ..mpu import comm
 
 
 def setup(config):

@@ -17,8 +17,8 @@ try:
 except ModuleNotFoundError:
     wandb_available = False
 
-import fno.mpu.comm as comm
-from fno.losses import LpLoss
+from ..mpu import comm
+from ..losses import LpLoss
 from .training_state import load_training_state, save_training_state
 
 

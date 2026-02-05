@@ -423,7 +423,7 @@ class FNO1d(FNO):
         lifting_channels=256,
         projection_channels=256,
         max_n_modes=None,
-        n_layers=3,
+        n_layers=4,
         resolution_scaling_factor=None,
         non_linearity=F.gelu,
         stabilizer=None,
