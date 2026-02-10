@@ -18,8 +18,7 @@ cuda: 5
 dataset: lung
 h5_dir: "/home/sshabani/projects/snuffy/datasets/tcga/encoded_uni/h5_files"
 labels_csv: "/home/sshabani/projects/snuffy/datasets/tcga/single/patients.csv"
-max_patches: 80000
-
+max_patches: 28000
 
 
 n_classes: 2
@@ -27,15 +26,15 @@ n_classes: 2
 ## training 
 mode: train #train #train #test
 batch_size: 1 
-epochs: 20 #30 #16 #3 #200
+epochs: 30 #30 #16 #3 #200
 
 ##optimizer 
-lr: 5e-5 #5e-6 #4e-5
+lr: 5e-6 #5e-6 #4e-5
 wd: 5e-3
 scheduler: plateau
 
 ## model
-backbone: MorphMIL #TransMIL
+backbone: transmil #MorphMIL #TransMIL
 adaptor: vit #fno
 pool: mean_median #max #max   attn
 emd_dim: 512 #512 #512 #1024 #1024
@@ -55,7 +54,7 @@ model_branch: image #both #both #image
 cancat_type: simple #one_to_all #simple #one_to_all
 
 ## loss 
-loss_type: ce # #ce_jsd #ce #ce_jsd #ce_con #ce #jsd #jsd #ce_jsd  #ce_con
+loss_type: ce #ce_jsd #ce_jsd #ce #ce_jsd #ce_con #ce #jsd #jsd #ce_jsd  #ce_con
 alpha_jsd: 40 #
 alpha_con: 0.1
 

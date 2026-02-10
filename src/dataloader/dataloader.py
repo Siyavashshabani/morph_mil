@@ -511,6 +511,7 @@ def train_val_loaders(
     strict: bool = True,
     use_weighted_sampler: bool = True, 
     aug_flag: bool = True,
+    max_patches: int = 50000
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """
     Returns: train_loader, val_loader, info_dict
@@ -526,7 +527,8 @@ def train_val_loaders(
         keep_morph_columns=keep_morph_columns,
         align_by_coords_if_possible=align_by_coords_if_possible,
         strict=strict,
-        aug_flag= aug_flag
+        aug_flag= aug_flag,
+        max_patches = max_patches
     )
     
     n = len(ds)

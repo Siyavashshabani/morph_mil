@@ -249,7 +249,8 @@ class Trainer:
                 num_workers=4,
                 pin_memory=True,
                 use_weighted_sampler= False, #True
-                aug_flag=cfg.get("aug_flag")
+                aug_flag=cfg.get("aug_flag"),
+                max_patches = cfg.get("max_patches")
             )
         elif self.dataset=="camelyon":
             print("camelyon-----------------------------------------------")
@@ -264,8 +265,26 @@ class Trainer:
                 num_workers=4,
                 pin_memory=True,
                 use_weighted_sampler= False, #True
-                aug_flag=cfg.get("aug_flag")
+                aug_flag=cfg.get("aug_flag"),
+                max_patches = cfg.get("max_patches")
+
             )
+        elif self.dataset=="lung":
+            print("lung-----------------------------------------------")
+            from dataloader.dataloaderLung import train_val_loaders 
+            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=4,
+                pin_memory=True,
+                aug_flag=cfg.get("aug_flag"),
+                max_patches = cfg.get("max_patches")
+            )
+
+
         else:
             raise ValueError(
                 f"Unknown dataset={self.dataset!r}. Expected one of: ['brca', 'camelyon']"
@@ -336,12 +355,12 @@ class Trainer:
         self.model.eval()
         y_true, y_pred, y_prob = [], [], []
         for batch in loader:
-            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
+            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)    # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)
-            morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
+            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
             if self.use_amp:
-                with autocast():
-                    out = self.model(x, morph)
+                    with autocast(dtype=torch.float16):
+                        out = self.model(x, morph)
             else:
                 out = self.model(x, morph)
 
@@ -453,14 +472,12 @@ class Trainer:
         running_loss, n_correct, n_total = 0.0, 0, 0
 
         for step, batch in enumerate(self.train_loader, 1):
-            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)   # (B,16,2048)
+            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)  # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)   # (B,)
-            morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
-
+            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
             i = 0
-
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast():
+            with autocast(dtype=torch.float16):
                 out = self.model(x, morph)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
                 # print("logits------------------------", logits.shape)
@@ -513,12 +530,12 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
+                x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0) 
                 y = batch["label"].to(self.device, non_blocking=True)
-                morph = batch["morph"].to(self .device, non_blocking=True).unsqueeze(0)               
+                morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
 
                 if self.use_amp:
-                    with autocast():
+                    with autocast(dtype=torch.float16):
                         out = self.model(x, morph)
                         logits, yhat, yprob = self._unpack_out(out)
                         loss = self.loss_fn(logits, y)

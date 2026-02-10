@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from dataloader.dataloader import train_val_loaders 
 # from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 import numpy as np, os
@@ -43,12 +44,8 @@ from torch.utils.tensorboard import SummaryWriter
 from model.morphMIL import MorphMIL
 from model.poolMIL import PoolMIL
 from model.utils import build_scheduler, build_loss
-import os, time
-from pathlib import Path
+from model.transMIL import TransMIL
 
-import torch
-import torch.nn.functional as F
-from loss.contrastiveLoss import SupConLoss
 
 def _to_numpy(a):
     import torch
@@ -213,10 +210,15 @@ def save_ckpt(state, path: str):
 
 def build_backbone(cfg):
     backbone = cfg.get("backbone")
+    print("backbone-----------------------", backbone)
     n_classes = cfg.get("n_classes")
     if backbone == "MorphMIL":
         device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
         model = MorphMIL(cfg= cfg, n_classes = n_classes).to(device)
+        return model
+    if backbone == "transmil":
+        device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
+        model = TransMIL(cfg= cfg, n_classes = n_classes).to(device)
         return model
 
 
@@ -253,8 +255,7 @@ class Trainer:
                 num_workers=4,
                 pin_memory=True,
                 use_weighted_sampler= False, #True
-                aug_flag=cfg.get("aug_flag"),
-                max_patches = cfg.get("max_patches"),
+                aug_flag=cfg.get("aug_flag")
             )
         elif self.dataset=="camelyon":
             print("camelyon-----------------------------------------------")
@@ -266,14 +267,32 @@ class Trainer:
                 val_ratio=0.2,
                 seed=42,
                 batch_size=1,
-                num_workers=1,
+                num_workers=4,
                 pin_memory=True,
                 use_weighted_sampler= False, #True
+                aug_flag=cfg.get("aug_flag")
+            )
+        elif self.dataset=="lung":
+            print("lung-----------------------------------------------")
+            from dataloader.dataloaderLung import train_val_loaders 
+            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=4,
+                pin_memory=True,
                 aug_flag=cfg.get("aug_flag"),
                 max_patches = cfg.get("max_patches"),
             )
 
 
+        else:
+            raise ValueError(
+                f"Unknown dataset={self.dataset!r}. Expected one of: ['brca', 'camelyon']"
+            )
+        
         # Model / Optim / Loss
         base_dim = self.cfg.get("base_input_dim", 1024)
         morph_dim = self.cfg.get("morph_dim", 246)
@@ -294,37 +313,25 @@ class Trainer:
         self.scheduler, self._sched_mode = build_scheduler(self.optimizer, self.train_loader, cfg)
         
         ## define the lossfunction
-        # weights = torch.tensor([1.0, 61/9], device=self.device )  # use your train counts
-        # self.loss_fn = nn.CrossEntropyLoss(weight=weights )
+        weights = torch.tensor([1.0, 61/9], device=self.device )  # use your train counts
+        self.loss_fn = nn.CrossEntropyLoss(weight=weights )
 
         # AMP
         self.use_amp = bool(cfg.get("amp", True)) and torch.cuda.is_available()
         self.scaler = GradScaler(enabled=self.use_amp)
 
-        # ---- run id / folder name ----
-        self.run_name = self.cfg.get("run_name", "exp")
-        run_id = self.cfg.get("run_id", time.strftime("%Y%m%d-%H%M%S"))  # or uuid4()
-
-        # root folder for everything in this run
-        self.run_dir = Path(self.cfg.get("run_root", "experiments")) / f"{self.run_name}-{run_id}"
-
-        # only rank0 creates dirs and writes ckpts/tb
-        self._rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
-        if self._rank0:
-            self.run_dir.mkdir(parents=True, exist_ok=True)
-
-        # ---- checkpoints ----
-        self.outdir = str(self.run_dir / "checkpoints")
-        if self._rank0:
-            os.makedirs(self.outdir, exist_ok=True)
-
+        # Checkpoints
+        self.outdir = cfg.get("outdir", "checkpoints")
+        os.makedirs(self.outdir, exist_ok=True)
         self.ckpt_best = os.path.join(self.outdir, "best.pt")
         self.ckpt_last = os.path.join(self.outdir, "last.pt")
         self.best_val_acc = -1.0
 
-        # ---- tensorboard ----
-        self.tb_dir = str(self.run_dir / "tb")
-        self.tb = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
+        ## tensorboard 
+        self.run_name = self.cfg.get("run_name", "exp")
+        self.tb_dir   = self.cfg.get("tb_dir", f"runs/{self.run_name}-{time.strftime('%Y%m%d-%H%M%S')}")
+        self._rank0   = (not dist.is_initialized()) or dist.get_rank() == 0
+        self.tb       = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
 
         self.global_step = 0   # increments each train step
 
@@ -346,134 +353,24 @@ class Trainer:
         return lrs[0] if len(lrs) == 1 else lrs
 
 
-    def augmix_jsd_loss_from_probs(
-        self,
-        feats: torch.Tensor,          # e.g. [3, N, D] (3 views, N tokens, D dim)
-        yprob: torch.Tensor,          # [3, C] probabilities
-        target: torch.Tensor,         # scalar or [1]
-        alpha_jsd: float = 50.0,
-        alpha_con: float = 50.0,
-        eps: float = 1e-7,
-        return_parts: bool = True,
-        loss_type: str = "ce_jsd",    # "ce", "jsd", "ce_jsd", "ce_con"
-        temperature: float = 0.1,
-    ):
-        # -------------------------
-        # checks + canonical dtypes
-        # -------------------------
-        if yprob.dim() != 2 or yprob.size(0) != 3:
-            raise ValueError(f"Expected yprob [3, C], got {tuple(yprob.shape)}")
-
-        # probs to float32 for stability
-        yprob = yprob.float()
-
-        # target -> [1] long on same device
-        target = torch.as_tensor(target, device=yprob.device, dtype=torch.long)
-        if target.dim() == 0:
-            target = target.view(1)
-        if target.dim() != 1 or target.numel() != 1:
-            raise ValueError(f"target must be scalar or [1], got {tuple(target.shape)}")
-
-        # --------------------------------
-        # split probabilities: [1, C] each
-        # --------------------------------
-        p_clean = yprob[0:1]
-        p_aug1  = yprob[1:2]
-        p_aug2  = yprob[2:3]
-        
-        ## making ram free
-        del yprob
-        
-        # -------------------------
-        # CE (on clean) from probs
-        # -------------------------
-        p_clean_log = torch.log(torch.clamp(p_clean, eps, 1.0))
-        ce = F.nll_loss(p_clean_log, target)
-
-        # -------------------------
-        # JSD (AugMix style)
-        # -------------------------
-        p_mix = (p_clean + p_aug1 + p_aug2) / 3.0
-        p_mix_log = torch.log(torch.clamp(p_mix, eps, 1.0))
-
-        # IMPORTANT: F.kl_div expects (input=log-probs, target=probs) if log_target=False
-        kl_clean = F.kl_div(p_mix_log, p_clean, reduction="batchmean")
-        kl_aug1  = F.kl_div(p_mix_log, p_aug1,  reduction="batchmean")
-        kl_aug2  = F.kl_div(p_mix_log, p_aug2,  reduction="batchmean")
-        jsd = (kl_clean + kl_aug1 + kl_aug2) / 3.0
-
-        # -------------------------
-        # SupCon (3 views)
-        # feats expected like [3, N, D] or [3, D]
-        # We pool tokens -> [3, D] then -> [1, 3, D]
-        # labels should be [bsz]=[1]
-        # -------------------------
-        con = torch.tensor(0.0, device=self.device)
-        if loss_type == "ce_con" or return_parts:
-            if feats is None:
-                raise ValueError("feats is required for contrastive loss (ce_con).")
-
-            if feats.dim() == 3 and feats.size(0) == 3:
-                # [3, N, D] -> [3, D]
-                feats_view = feats.mean(dim=1)
-            elif feats.dim() == 2 and feats.size(0) == 3:
-                # [3, D]
-                feats_view = feats
-            else:
-                raise ValueError(f"Expected feats [3,N,D] or [3,D], got {tuple(feats.shape)}")
-
-            feats_view = F.normalize(feats_view, dim=-1)
-            feats_sc = feats_view.unsqueeze(0)  # [1, 3, D]
-
-            con_loss_fn = SupConLoss(temperature=temperature, contrast_mode="all").to(self.device)
-            con = con_loss_fn(feats_sc, labels=target)
-
-        # -------------------------
-        # choose loss
-        # -------------------------
-        if loss_type == "ce":
-            loss = ce
-        elif loss_type == "jsd":
-            loss = jsd
-        elif loss_type == "ce_jsd":
-            loss = ce + alpha_jsd * jsd
-        elif loss_type == "ce_con":
-            loss = ce + alpha_con * con
-        else:
-            raise ValueError(f"Unknown loss_type='{loss_type}'. Use: ce, jsd, ce_jsd, ce_con")
-
-        if return_parts:
-            return {
-                "loss": loss,
-                "ce": ce.detach(),
-                "jsd": jsd.detach(),
-                "con": con.detach(),
-            }
-        return loss
-            
-        # return loss, {"ce": ce, "jsd": jsd, "kl_clean": kl_clean, "kl_aug1": kl_aug1, "kl_aug2": kl_aug2}
-
-
-
-
     @torch.no_grad()
     def _predict_on_loader(self, loader):
         self.model.eval()
         y_true, y_pred, y_prob = [], [], []
         for batch in loader:
-            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
+            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
             y = batch["label"].to(self.device, non_blocking=True)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                   
+            # morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
             if self.use_amp:
                 with autocast():
-                    out = self.model(x, morph)
+                    out = self.model(x)
             else:
-                out = self.model(x, morph)
+                out = self.model(x)
 
             logits, yhat, yprob = self._unpack_out(out)  # your existing helper
             print("logits, yhat, yprob--------------", logits.shape, yhat.shape, yprob.shape)
-            preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
-            probs = yprob[0:1] if yprob[0:1] is not None else torch.softmax(logits[0:1], dim=1)
+            preds = yhat if yhat is not None else logits.argmax(dim=1)
+            probs = yprob if yprob is not None else torch.softmax(logits, dim=1)
 
             y_true.append(y.detach().cpu())
             y_pred.append(preds.detach().cpu())
@@ -499,7 +396,7 @@ class Trainer:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_grad_enabled(False)
 
-        loader = loader or getattr(self, "test_loader", None) or self.test_loader
+        loader = loader or getattr(self, "test_loader", None) or self.val_loader
 
         # Expect these from your implementation
         y_true, y_pred, y_prob = self._predict_on_loader(loader)
@@ -537,7 +434,7 @@ class Trainer:
         # ---- Save PNGs (your existing helper)
         out_dir = getattr(self, "pics", "pics")
         os.makedirs(out_dir, exist_ok=True)
-        if self.cfg["backbone"]=="TransMIL":
+        if self.cfg["backbone"]=="transmil":
             raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_cm.png")
             norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_cm_norm.png")
         elif self.cfg["backbone"]=="poolMIL":
@@ -578,39 +475,36 @@ class Trainer:
         running_loss, n_correct, n_total = 0.0, 0, 0
 
         for step, batch in enumerate(self.train_loader, 1):
-            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
-            # print("x.shape-----------------------", x.shape)
-            target = batch["label"].to(self.device, non_blocking=True)  # (B,)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                  
+            x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)   # (B,16,2048)
+            y = batch["label"].to(self.device, non_blocking=True)   # (B,)
+            # morph = batch["morph"].to(self.device, non_blocking=True).unsqueeze(0)               
+
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
             with autocast():
-                out = self.model(x, morph)                        # dict or tensor
+                out = self.model(x)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
-                loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
-                                                       return_parts=False, 
-                                                       loss_type= self.cfg.get("loss_type"),      
-                                                       alpha_jsd=self.cfg.get("alpha_jsd"),
-                                                       alpha_con=self.cfg.get("alpha_con")
-                                                       )
-                # print("loss_total:", loss.item())
+                # print("logits------------------------", logits.shape)
+                # print("yhat--------------------------", yhat.shape, yhat)
+                # print("yprob-------------------------", yprob.shape, yprob)
+                # print("y-----------------------------", y.shape)
                 # exit()
-
+                loss = self.loss_fn(logits, y)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
 
             running_loss += loss.item() * x.size(0)
-            preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
-            n_correct += (preds == target).sum().item()
-            n_total   += target.numel()
+            preds = yhat if yhat is not None else logits.argmax(dim=1)
+            n_correct += (preds == y).sum().item()
+            n_total   += y.numel()
 
             # ---- TensorBoard: step logs (rank-0 only)
             if self._rank0 and self.tb is not None:
                 # step-wise (use batch accuracy so it’s not noisy from running totals)
-                batch_acc = (preds == target).float().mean().item() * 100.0
+                batch_acc = (preds == y).float().mean().item() * 100.0
                 self.tb.add_scalar("train/loss_step", loss.item(), self.global_step)
                 self.tb.add_scalar("train/acc_step",  batch_acc,  self.global_step)
                 self.tb.add_scalar("train/lr",        self._get_lr(), self.global_step)
@@ -641,37 +535,24 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
-                target = batch["label"].to(self.device, non_blocking=True)
-                morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
+                x = batch["feats"].to(self.device, non_blocking=True).unsqueeze(0)
+                y = batch["label"].to(self.device, non_blocking=True)
+                # morph = batch["morph"].to(self .device, non_blocking=True).unsqueeze(0)               
 
                 if self.use_amp:
                     with autocast():
-                        out = self.model(x, morph)
+                        out = self.model(x)
                         logits, yhat, yprob = self._unpack_out(out)
-                        loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
-                                                               return_parts=False, 
-                                                               loss_type= self.cfg.get("loss_type"),
-                                                               alpha_jsd=self.cfg.get("alpha_jsd"),
-                                                               alpha_con=self.cfg.get("alpha_con")
-                                                               )
+                        loss = self.loss_fn(logits, y)
                 else:
-                    out = self.model(x, morph)
+                    out = self.model(x )
                     logits, yhat, yprob = self._unpack_out(out)
-                    loss = self.augmix_jsd_loss_from_probs(x, yprob, target,
-                                                           eturn_parts=False, 
-                                                           loss_type= self.cfg.get("loss_type"),
-                                                           alpha_jsd=self.cfg.get("alpha_jsd"),
-                                                           alpha_con=self.cfg.get("alpha_con")
-                                                           )
+                    loss = self.loss_fn(logits, y)
 
                 running_loss += loss.item() * x.size(0)
-                preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
-                n_correct += (preds == target).sum().item()
-                n_total   += target.numel()
-                
-                ## make free the memory               
-                del out, logits, yhat, yprob, loss, x, target, morph, preds
+                preds = yhat if yhat is not None else logits.argmax(dim=1)
+                n_correct += (preds == y).sum().item()
+                n_total   += y.numel()
 
         val_loss = running_loss / max(1, n_total)
         val_acc  = 100.0 * n_correct / max(1, n_total)
@@ -746,9 +627,12 @@ class Trainer:
         
         
 
+
+
+
 # ---------- Main ----------
 def main():
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainJsdMorphMIL.yaml"))
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainLungMIL.yaml"))
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -760,6 +644,7 @@ def main():
     # full training        
     trainer.fit()
     print(cfg)
+    
 
 if __name__ == "__main__":
     main()

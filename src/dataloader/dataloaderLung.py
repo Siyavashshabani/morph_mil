@@ -14,6 +14,18 @@ from pathlib import Path
 from torch.utils.data import WeightedRandomSampler
 import torch
 import numpy as np
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+import h5py
+import numpy as np
+import torch
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
 # from augment import TensorAugment
 from .augment import TensorAugment
 
@@ -86,6 +98,42 @@ def normalize_slide_id_generic(x: str) -> str:
 
 
 
+
+
+import numpy as np
+import torch
+from typing import Optional
+
+def _h5_to_tensor(x, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    arr = np.asarray(x)
+
+    # Debug (optional)
+    # print("shape:", getattr(arr, "shape", None), "dtype:", getattr(arr, "dtype", None), "type:", type(arr))
+
+    # If it's an object array (very common cause of your error), force numeric
+    if isinstance(arr, np.ndarray) and arr.dtype == object:
+        # try to coerce to float32; change to int64 if you expect ints
+        arr = arr.astype(np.float32)
+
+    # Ensure plain ndarray + contiguous memory
+    if isinstance(arr, np.ndarray):
+        arr = np.ascontiguousarray(arr)
+
+        try:
+            t = torch.from_numpy(arr)
+        except Exception:
+            # last resort: convert via Python lists (slower but robust)
+            t = torch.tensor(arr.tolist())
+    else:
+        # scalar / non-array fallback
+        t = torch.tensor(arr.item() if hasattr(arr, "item") else arr)
+
+    if dtype is not None:
+        t = t.to(dtype)
+    return t
+
+
+
 def load_h5_embedding(h5_path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
     h5_path = Path(h5_path)
 
@@ -97,21 +145,21 @@ def load_h5_embedding(h5_path: Path) -> Tuple[torch.Tensor, Optional[torch.Tenso
 
     with h5py.File(h5_path, "r") as f:
         keys = list(f.keys())
-
         if "features" in f:
-            feats = torch.from_numpy(f["features"][:])
+            feats = _h5_to_tensor(f["features"][...], dtype=torch.float32)
         elif "feats" in f:
-            feats = torch.from_numpy(f["feats"][:])
+            feats = _h5_to_tensor(f["feats"][...], dtype=torch.float32)
         else:
             raise KeyError(f"No 'features' or 'feats' in {h5_path}. Keys: {keys}")
 
-        coords = torch.from_numpy(f["coords"][:]) if "coords" in f else None
-        # print("feats------------------------------------", feats.shape, feats.dtype)
-        # exit()
-    meta = {
+        coords = _h5_to_tensor(f["coords"][...], dtype=torch.int64) if "coords" in f else None
+    
+    meta: Dict[str, Any] = {
         "h5_keys": keys,
         "features_shape": tuple(feats.shape),
         "coords_shape": tuple(coords.shape) if coords is not None else None,
+        "features_dtype": str(feats.dtype),
+        "coords_dtype": str(coords.dtype) if coords is not None else None,
     }
     return feats, coords, meta
 
@@ -200,90 +248,77 @@ def align_morph_to_coords(
 
     return out
 
+
+
+
+from collections import defaultdict
+
 @dataclass
 class BRCAItem:
     slide_id: str
     h5_path: Path
-    morph_path: Path
     label: int
 
-class BRCAEmbedMorphDataset(Dataset):
+
+class BRCAEmbedDataset(Dataset):
     def __init__(
         self,
         h5_dir: str | Path,
-        morph_dir: str | Path,
         labels_csv: str | Path,
         label_col: str = "label",
         slide_id_col: str = "slide_id",
-        keep_morph_columns: Optional[List[str]] = None,
-        align_by_coords_if_possible: bool = True,
         strict: bool = True,
-        max_patches: int = 40000,   # <-- add this
+        max_patches: int = 40000,
         aug_flag: bool = True,
+        # keep_morph_columns / align_by_coords_if_possible removed
     ):
         self.h5_dir = Path(h5_dir)
-        self.morph_dir = Path(morph_dir)
         self.labels_csv = Path(labels_csv)
 
+        self._rng = None  # set per-worker (see worker_init_fn below)
+        self._base_seed = 42
+        self.aug_replace = True
+        
         if not self.h5_dir.exists():
             raise FileNotFoundError(f"h5_dir not found: {self.h5_dir}")
-        if not self.morph_dir.exists():
-            raise FileNotFoundError(f"morph_dir not found: {self.morph_dir}")
         if not self.labels_csv.exists():
             raise FileNotFoundError(f"labels_csv not found: {self.labels_csv}")
 
-        self.keep_morph_columns = keep_morph_columns
-        self.align_by_coords_if_possible = align_by_coords_if_possible
         self.strict = strict
 
         # ---- load labels ----
         df_lab = pd.read_csv(self.labels_csv)
-        # print("df_lab---------------------------------", df_lab)
-        # exit()
         if slide_id_col not in df_lab.columns or label_col not in df_lab.columns:
             raise ValueError(
                 f"labels_csv must contain columns {slide_id_col!r} and {label_col!r}. "
                 f"Got: {list(df_lab.columns)}"
             )
 
-        # map slide_id -> label (raw first)
         labels_map: Dict[str, Any] = {}
         for _, r in df_lab.iterrows():
             sid = normalize_slide_id_generic(r[slide_id_col])
-            sid = sid.removesuffix(".tif")   # Python 3.9+
+            # print("sid-------------------", sid)
             labels_map[sid] = r[label_col]
-        # print("labels_map------------------------", labels_map)
 
-
-        ### removing bad labels
-        allowed = {"normal", "tumor"}
+        # ---- validate labels ----
+        allowed = {"luad", "lusc"}
         uniq = set(labels_map.values())
         bad = uniq - allowed
         if bad:
             raise ValueError(f"Unexpected labels found: {bad}. Expected only {allowed}.")
 
-        # Choose your encoding (IDC=0, ILC=1)
-        self.label_to_int = {"normal": 0, "tumor": 1}
-        self.int_to_label = {0: "normal", 1: "tumor"}
+        self.label_to_int = {"luad": 0, "lusc": 1}
+        self.int_to_label = {0: "luad", 1: "lusc"}
 
         # ---- index H5 files ----
         h5_map: Dict[str, Path] = {}
-        for p in sorted(self.h5_dir.glob("*.h5")):
-            h5_map[p.stem] = p
-        for p in sorted(self.h5_dir.glob("*.hdf5")):
-            h5_map[p.stem] = p
-        # print("h5_map---------------------------", h5_map)
-        
-        # ---- index morph CSV files ----
-        morph_map: Dict[str, Path] = {}
-        for c in sorted(self.morph_dir.glob("*.csv")):
-            sid = normalize_slide_id_from_morph_csv(c)
-            morph_map[sid] = c
 
-        # print("morph_map------------------------", morph_map)
-        # exit()
-        # ---- build items: intersection of (pt, morph, label) ----
-        keys = set(h5_map.keys()) & set(morph_map.keys())
+        for p in sorted(list(self.h5_dir.glob("*.h5")) + list(self.h5_dir.glob("*.hdf5"))):
+            key = p.name.split(".", 1)[0]   # or p.stem.split(".", 1)[0]
+            h5_map[key] = p
+
+        # ---- build items: (h5, label) only ----
+        keys = set(h5_map.keys())
 
         items: List[BRCAItem] = []
         missing_label = 0
@@ -300,27 +335,18 @@ class BRCAEmbedMorphDataset(Dataset):
             if label_val is None:
                 missing_label += 1
                 if strict:
-                    continue  # skip
-                else:
-                    label_int = -1
+                    continue
+                label_int = -1
             else:
-                # label_val is now guaranteed "IDC" or "ILC"
                 label_int = self.label_to_int[label_val]
 
-            items.append(
-                BRCAItem(
-                    slide_id=sid,
-                    h5_path=h5_map[sid],
-                    morph_path=morph_map[sid],
-                    label=label_int,
-                )
-            )
+            items.append(BRCAItem(slide_id=sid, h5_path=h5_map[sid], label=label_int))
+
         print("len(self.items)----------------------------", len(items))
         if strict and len(items) == 0:
             raise RuntimeError(
                 "No matched items found. Likely slide_id formatting mismatch.\n"
-                f"Example PT key: {next(iter(pt_map.keys())) if pt_map else 'NONE'}\n"
-                f"Example Morph key: {next(iter(morph_map.keys())) if morph_map else 'NONE'}\n"
+                f"Example H5 key: {next(iter(h5_map.keys())) if h5_map else 'NONE'}\n"
                 f"Example Label key: {next(iter(labels_map.keys())) if labels_map else 'NONE'}\n"
                 "Tip: If your labels slide_id column has no UUID part, it may only match sid.split('.')[0]."
             )
@@ -332,47 +358,48 @@ class BRCAEmbedMorphDataset(Dataset):
             kept: List[BRCAItem] = []
             dropped: List[tuple[str, int]] = []
 
-            for it in items:
+            for it in self.items:
                 n = h5_num_patches(it.h5_path)  # cheap: reads only dataset shape
                 if n <= max_patches:
                     kept.append(it)
                 else:
                     dropped.append((it.slide_id, n))
 
-            if len(dropped) > 0:
+            if dropped:
                 print(f"[Dataset] Dropped {len(dropped)} slides with > {max_patches} patches.")
-                # show a few
                 for sid, n in dropped[:10]:
                     print(f"  - {sid}: {n}")
 
-            self.items = kept        
-        
-        
+            self.items = kept
+
+
+        # ✅ ADD THIS RIGHT HERE (after filtering, so indices match final items)
+        self.label_to_indices = defaultdict(list)
+        for k, it in enumerate(self.items):
+            if it.label >= 0:              # skip unknown if strict=False
+                self.label_to_indices[it.label].append(k)
+
+
         self._missing_label = missing_label
 
-        
-        ## augmentation 
-        self.aug_flag = aug_flag 
+
+        ## 
+        self.label_to_indices = defaultdict(list)
+        for k, it in enumerate(self.items):
+            # optional: skip unknown labels
+            if it.label >= 0:
+                self.label_to_indices[it.label].append(k)
+
+
+        # ---- augmentation ----
+        self.aug_flag = aug_flag
         self.aug = TensorAugment(
-            # drop more tokens, more often
             p_token_drop=0.45, token_drop_frac=0.30, token_drop_mode="zero",
-
-            # shuffle more often; increase local disruption
             p_token_shuffle=0.40, local_shuffle=True, local_window=8,
-
-            # mask longer spans more often
             p_token_span_mask=0.45, token_span_frac=0.45,
-
-            # stronger feature noise
             p_feat_jitter=0.80, feat_jitter_sigma=0.06,
-
-            # mask more feature bands
             p_feat_band_mask=0.55, feat_band_frac=0.20,
-
-            # stronger scale/shift jitter
             p_feat_affine=0.55, affine_scale_std=0.20, affine_shift_std=0.05,
-
-            # cut out bigger rectangles more often
             p_rect_cutout=0.45, rect_token_frac=0.45, rect_feat_frac=0.30
         )
 
@@ -384,77 +411,115 @@ class BRCAEmbedMorphDataset(Dataset):
             p_feat_band_mask=0.30, feat_band_frac=0.10,
             p_feat_affine=0.25, affine_scale_std=0.10, affine_shift_std=0.02,
             p_rect_cutout=0.20, rect_token_frac=0.25, rect_feat_frac=0.18
-        )      
-        
+        )
+
+
+    def mix_replace_tokens_one_view(
+        self,
+        feats: torch.Tensor,
+        feats_donor: torch.Tensor,
+        *,
+        replace_frac: float = 0.25,
+    ) -> torch.Tensor:
+        self._ensure_rng()
+
+        if feats.dim() != 2 or feats_donor.dim() != 2:
+            raise ValueError(f"Expected [N,D]. Got {tuple(feats.shape)} and {tuple(feats_donor.shape)}")
+        if feats.size(1) != feats_donor.size(1):
+            raise ValueError(f"D mismatch: {feats.size(1)} vs {feats_donor.size(1)}")
+
+        Na = int(feats.shape[0])
+        Nd = int(feats_donor.shape[0])
+        if Na == 0 or Nd == 0:
+            return feats.clone()
+
+        k = max(1, int(round(float(replace_frac) * Na)))
+        k = min(k, Na)
+
+        idx_a = self._rng.choice(Na, size=k, replace=False)
+        idx_d = self._rng.choice(Nd, size=k, replace=True)
+
+        out = feats.clone()
+        idx_a_t = torch.as_tensor(idx_a, device=out.device, dtype=torch.long)
+        idx_d_t = torch.as_tensor(idx_d, device=out.device, dtype=torch.long)
+        out[idx_a_t] = feats_donor[idx_d_t]
+        return out
+
+    def _ensure_rng(self):
+        if self._rng is None:
+            # single-process fallback (num_workers=0)
+            self._rng = np.random.default_rng(self._base_seed)
+            
+    def _sample_same_label_index(self, label: int, avoid: set[int]) -> int:
+        """
+        Sample an index from the same-label pool, avoiding any indices in `avoid`.
+        Falls back to a non-avoided index if pool is small.
+        """
+        pool = self.label_to_indices[label]
+        if len(pool) == 0:
+            return next(iter(avoid))  # should never happen if labels_to_indices built correctly
+
+        # if there is at least one candidate not in avoid
+        candidates = [k for k in pool if k not in avoid]
+        if len(candidates) > 0:
+            return int(self._rng.choice(candidates))
+
+        # otherwise (pool too small), just return something from pool
+        return int(self._rng.choice(pool))
+
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        self._ensure_rng()
         it = self.items[idx]
 
-        feats, coords, h5_meta = load_h5_embedding(it.h5_path)  # feats: [N,D], coords: [N,2] or None
-        morph_X, morph_coords, morph_names = load_morph_csv(
-            it.morph_path,
-            drop_non_numeric=True,
-            keep_columns=self.keep_morph_columns,
-        )
+        feats, coords, h5_meta = load_h5_embedding(it.h5_path)  # [Na, D]
 
-        # Normalize morph features to [0,1] BEFORE alignment
-        morph_X = minmax_01_np(morph_X)
+        if self.aug_flag and self.aug_replace:
+            # pick two different same-label donors
+            j = self._sample_same_label_index(it.label, avoid={idx})
+            k = self._sample_same_label_index(it.label, avoid={idx, j})
 
-        # Align morph to ALL patches in H5 (missing patches -> zeros)
-        if self.align_by_coords_if_possible and (coords is not None) and (morph_coords is not None):
-            morph_aligned = align_morph_to_coords(
-                bag_coords=coords,        # ✅ coords from h5
-                morph_X=morph_X,
-                morph_coords=morph_coords,
-                fill_value=0.0,
-            )
-            morph_tensor = torch.from_numpy(morph_aligned)  # [N,K]
-            morph_is_aligned = True
-        else:
-            morph_tensor = torch.from_numpy(morph_X)        # [M,K]
-            morph_is_aligned = False
+            it_b = self.items[j]
+            it_c = self.items[k]
 
+            feats_b, _, _ = load_h5_embedding(it_b.h5_path)
+            feats_c, _, _ = load_h5_embedding(it_c.h5_path)
 
+            feats_aug1 = self.mix_replace_tokens_one_view(feats, feats_b, replace_frac=0.5)
+            feats_aug2 = self.mix_replace_tokens_one_view(feats, feats_c, replace_frac=0.5)
 
-        ### adding the augmetations
-        if self.aug_flag== True: 
+            feats = torch.stack([feats, feats_aug1, feats_aug2], dim=0)  # [3, Na, D]
+
+        elif self.aug_flag:
+            # your original augmentation path (if you still want it)
             feats_aug1 = self.aug(feats.clone())
             feats_aug2 = self.aug_light(feats.clone())
-            feats = torch.stack([feats, feats_aug1, feats_aug2], dim=0)  # [3, N, D]
-            # it.label = torch.as_tensor(it.label, dtype=torch.long).repeat(3)
-        # print("feats-------------------------------", feats.shape)
-        # exit()
+            feats = torch.stack([feats, feats_aug1, feats_aug2], dim=0)
+
         return {
             "slide_id": it.slide_id,
-
-            # what your training loop uses
             "feats": feats,
             "label": it.label,
-
-            # extra info (kept, not necessarily used in training loop)
             "coords": coords,
-            "morph": morph_tensor,
-            "morph_feature_names": morph_names,
-            "morph_aligned": morph_is_aligned,
-
             "h5_meta": h5_meta,
             "h5_path": str(it.h5_path),
-            "morph_path": str(it.morph_path),
         }
-
-
 import torch
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+import numpy as np
+from torch.utils.data import Subset, DataLoader
 
+
+# -------------------------------------------------------------------
+# Collate (morph removed)
+# -------------------------------------------------------------------
 def clam_like_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     MIL collate:
-    - batch_size==1: return tensors directly so training loop can do:
-        x = batch["feats"].to(device)
-        y = batch["label"].to(device)
+    - batch_size==1: return tensors directly
     - batch_size>1: return lists for variable-length bags.
     """
     assert len(batch) >= 1
@@ -463,46 +528,29 @@ def clam_like_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         b = batch[0]
         return {
             "slide_id": b["slide_id"],
-            "feats": b["feats"],                         # Tensor [N,D]
-            "label": torch.tensor([b["label"]], dtype=torch.long),  # shape [1]
+            "feats": b["feats"],  # Tensor [N,D] or [3,N,D] if aug enabled
+            "label": torch.tensor([b["label"]], dtype=torch.long),  # [1]
 
-            "coords": b.get("coords", None),             # Tensor [N,2] or None
-            "morph": b.get("morph", None),               # Tensor [N,K] or [M,K]
-            "morph_feature_names": b.get("morph_feature_names", []),
-            "morph_aligned": b.get("morph_aligned", False),
-
+            "coords": b.get("coords", None),     # Tensor [N,2] or None
             "h5_path": b.get("h5_path", None),
-            "morph_path": b.get("morph_path", None),
             "h5_meta": b.get("h5_meta", None),
         }
 
     # batch_size > 1 (variable-length bags)
     return {
         "slide_id": [b["slide_id"] for b in batch],
-        "feats": [b["feats"] for b in batch],  # list of [Ni,D]
+        "feats": [b["feats"] for b in batch],  # list of [Ni,D] or [3,Ni,D]
         "label": torch.tensor([b["label"] for b in batch], dtype=torch.long),  # [B]
 
         "coords": [b.get("coords", None) for b in batch],
-        "morph": [b.get("morph", None) for b in batch],
-        "morph_feature_names": batch[0].get("morph_feature_names", []) if len(batch) else [],
-        "morph_aligned": [b.get("morph_aligned", False) for b in batch],
-
         "h5_path": [b.get("h5_path", None) for b in batch],
-        "morph_path": [b.get("morph_path", None) for b in batch],
         "h5_meta": [b.get("h5_meta", None) for b in batch],
     }
 
 
-
-###########################################################################################
-###########################################################################################
-###########################################################################################
-###########################################################################################
-###########################################################################################
-
-import numpy as np
-from torch.utils.data import Subset, DataLoader
-
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def _get_sid_from_dataset(ds, i: int) -> str:
     # If ds is a Subset, map i -> original index
     if isinstance(ds, Subset):
@@ -522,72 +570,82 @@ def _get_sid_from_dataset(ds, i: int) -> str:
     raise RuntimeError("Can't infer slide id from dataset.")
 
 
+
+
+# -------------------------------------------------------------------
+# Train/val/test loaders (morph removed)
+# -------------------------------------------------------------------
+import numpy as np
+from torch.utils.data import Subset, DataLoader
+from typing import Any, Dict, Tuple
+
 def train_val_loaders(
     h5_dir: str,
-    morph_dir: str,
     labels_csv: str,
     *,
     val_ratio: float = 0.3,
+    test_ratio: float = 0.1,   # NEW: random test split too
     seed: int = 42,
     batch_size: int = 1,
     num_workers: int = 4,
     pin_memory: bool = True,
     shuffle_train: bool = True,
     shuffle_val: bool = False,
-    keep_morph_columns=None,
-    align_by_coords_if_possible: bool = True,
+    shuffle_test: bool = False,
     strict: bool = True,
-    use_weighted_sampler: bool = True, 
     aug_flag: bool = True,
-    max_patches: int = 50000,
-) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
+    max_patches: int = 40000,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Returns: train_loader, val_loader, info_dict
-    Splits at slide level (items) using random permutation.
+    Returns: train_loader, val_loader, test_loader
+    Random splits across all items (no filename-based test set).
     """
 
-    ds = BRCAEmbedMorphDataset(
+    ds = BRCAEmbedDataset(
         h5_dir=h5_dir,
-        morph_dir=morph_dir,
         labels_csv=labels_csv,
-        slide_id_col="image",
-        label_col="type",
-        keep_morph_columns=keep_morph_columns,
-        align_by_coords_if_possible=align_by_coords_if_possible,
+        slide_id_col="slide",
+        label_col="label",
         strict=strict,
-        max_patches= max_patches,
-        aug_flag= aug_flag
+        max_patches=max_patches,
+        aug_flag=aug_flag,
     )
-    
+
     n = len(ds)
+    if n < 3:
+        raise ValueError(f"Dataset too small for train/val/test split: n={n}")
 
-    test_idx, rest_idx = [], []
-    for i in range(n):
-        sid = _get_sid_from_dataset(ds, i)
-        sid_base = sid.split("/")[-1].removesuffix(".tif").removesuffix(".tiff")
-        if sid_base.startswith("test_"):
-            test_idx.append(i)
-        else:
-            rest_idx.append(i)
+    if not (0.0 <= val_ratio < 1.0 and 0.0 <= test_ratio < 1.0 and (val_ratio + test_ratio) < 1.0):
+        raise ValueError("Require: val_ratio>=0, test_ratio>=0, and val_ratio + test_ratio < 1.0")
 
-    # split rest -> train/val
     rng = np.random.RandomState(seed)
-    rest_idx = np.array(rest_idx)
-    rng.shuffle(rest_idx)
+    all_idx = np.arange(n)
+    rng.shuffle(all_idx)
 
-    n_val = max(1, int(round(len(rest_idx) * val_ratio)))
-    val_idx = rest_idx[:n_val].tolist()
-    train_idx = rest_idx[n_val:].tolist()
+    n_test = int(round(n * test_ratio))
+    n_val  = int(round(n * val_ratio))
+
+    # make sure each split is non-empty when possible
+    n_test = max(1, n_test) if n >= 3 and test_ratio > 0 else n_test
+    n_val  = max(1, n_val)  if n >= 3 and val_ratio  > 0 else n_val
+    if n_test + n_val >= n:
+        # fallback: guarantee at least 1 train
+        n_test = min(n_test, n - 2)
+        n_val  = min(n_val,  n - 1 - n_test)
+
+    test_idx = all_idx[:n_test].tolist()
+    val_idx  = all_idx[n_test:n_test + n_val].tolist()
+    train_idx = all_idx[n_test + n_val:].tolist()
 
     train_ds = Subset(ds, train_idx)
     val_ds   = Subset(ds, val_idx)
     test_ds  = Subset(ds, test_idx)
 
-
-    print("Example test sids:", [_get_sid_from_dataset(ds, i) for i in test_idx[:5]])
     print("Example train sids:", [_get_sid_from_dataset(ds, i) for i in train_idx[:5]])
+    print("Example val sids:  ", [_get_sid_from_dataset(ds, i) for i in val_idx[:5]])
+    print("Example test sids: ", [_get_sid_from_dataset(ds, i) for i in test_idx[:5]])
+    print(f"Counts: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
 
-    ### dataloaders
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -611,54 +669,33 @@ def train_val_loaders(
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
-        shuffle=False,  # keep deterministic
+        shuffle=shuffle_test,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=clam_like_collate,
         drop_last=False,
     )
 
-    print(f"Counts: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-
-
-    # helpful stats
-    def _count_labels(subset: Subset) -> Dict[int, int]:
-        counts: Dict[int, int] = {}
-        for i in subset.indices:
-            y = ds.items[i].label
-            counts[y] = counts.get(y, 0) + 1
-        return counts
-
-    # info = {
-    #     "n_total": n,
-    #     "n_train": len(train_idx),
-    #     "n_val": len(val_idx),
-    #     "label_to_int": getattr(ds, "label_to_int", None),
-    #     "int_to_label": getattr(ds, "int_to_label", None),
-    #     "train_label_counts": _count_labels(train_ds),
-    #     "val_label_counts": _count_labels(val_ds),
-    # }
-
     return train_loader, val_loader, test_loader
 
 
 # ---------------- EXAMPLE USAGE ----------------
 if __name__ == "__main__":
-    h5_dir = "/home/sshabani/projects/camelyon/data/encoded_uni/h5_files"
-    morph_dir = "/home/sshabani/projects/camelyon/data/morphs_csv"
-    labels_csv = "/home/sshabani/projects/camelyon/data/CAMELYON16/evaluation/reference.csv"
+    h5_dir = "/home/sshabani/projects/snuffy/datasets/tcga/encoded_uni/h5_files"
+    labels_csv = "/home/sshabani/projects/snuffy/datasets/tcga/single/patients.csv"
 
-    train_loader, val_loader, info = train_val_loaders(
+    train_loader, val_loader, test_loader = train_val_loaders(
         h5_dir=h5_dir,
-        morph_dir=morph_dir,
         labels_csv=labels_csv,
         val_ratio=0.2,
         seed=42,
         batch_size=1,
         num_workers=4,
         pin_memory=True,
+        strict=True,
+        aug_flag=True,
+        max_patches= 50000,
     )
 
-    print("Split info:", info)
     batch = next(iter(train_loader))
     print("train batch slide:", batch["slide_id"], "label:", batch["label"][0].item())

@@ -163,9 +163,9 @@ class TransMIL(nn.Module):
         self.dropout = nn.Dropout(p=0.2)          # try 0.2–0.5
 
 
-    def forward(self, **kwargs):
+    def forward(self, x):
         
-        h = kwargs['data'].float() #[B, n, 1024]
+        h = x.float() #[B, n, 1024]
         # print("h------------------------------------shape:", h.shape)
         # exit()
         h = self._fc1(h) #[B, n, 512]

@@ -42,6 +42,8 @@ from torch.utils.tensorboard import SummaryWriter
 # import timm
 from model.morphMIL import MorphMIL
 from model.poolMIL import PoolMIL
+from model.transMIL import TransMIL
+
 from model.utils import build_scheduler, build_loss
 import os, time
 from pathlib import Path
@@ -218,7 +220,10 @@ def build_backbone(cfg):
         device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
         model = MorphMIL(cfg= cfg, n_classes = n_classes).to(device)
         return model
-
+    elif backbone == "transmil":
+        device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
+        model = TransMIL(cfg= cfg, n_classes = n_classes).to(device)
+        return model
 
 def _unpack_out(out):
     if isinstance(out, dict):
@@ -272,6 +277,21 @@ class Trainer:
                 aug_flag=cfg.get("aug_flag"),
                 max_patches = cfg.get("max_patches"),
             )
+        elif self.dataset=="lung":
+            print("lung-----------------------------------------------")
+            from dataloader.dataloaderLung import train_val_loaders 
+            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
+                h5_dir=cfg.get("h5_dir"),
+                labels_csv=cfg.get("labels_csv"),
+                val_ratio=0.2,
+                seed=42,
+                batch_size=1,
+                num_workers=1,
+                pin_memory=True,
+                aug_flag=cfg.get("aug_flag"),
+                max_patches = cfg.get("max_patches"),
+            )
+
 
 
         # Model / Optim / Loss
@@ -320,7 +340,9 @@ class Trainer:
 
         self.ckpt_best = os.path.join(self.outdir, "best.pt")
         self.ckpt_last = os.path.join(self.outdir, "last.pt")
-        self.best_val_acc = -1.0
+        self.save_best_by = self.cfg.get("save_best_by", "val_acc")  # "val_acc" or "val_loss"
+        self.best_val_acc = -math.inf
+        self.best_val_loss = math.inf
 
         # ---- tensorboard ----
         self.tb_dir = str(self.run_dir / "tb")
@@ -463,12 +485,12 @@ class Trainer:
         for batch in loader:
             x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                   
+            # morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                   
             if self.use_amp:
                 with autocast():
-                    out = self.model(x, morph)
+                    out = self.model(x)
             else:
-                out = self.model(x, morph)
+                out = self.model(x)
 
             logits, yhat, yprob = self._unpack_out(out)  # your existing helper
             print("logits, yhat, yprob--------------", logits.shape, yhat.shape, yprob.shape)
@@ -537,7 +559,7 @@ class Trainer:
         # ---- Save PNGs (your existing helper)
         out_dir = getattr(self, "pics", "pics")
         os.makedirs(out_dir, exist_ok=True)
-        if self.cfg["backbone"]=="TransMIL":
+        if self.cfg["backbone"]=="transmil":
             raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_cm.png")
             norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_cm_norm.png")
         elif self.cfg["backbone"]=="poolMIL":
@@ -581,12 +603,12 @@ class Trainer:
             x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
             # print("x.shape-----------------------", x.shape)
             target = batch["label"].to(self.device, non_blocking=True)  # (B,)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                  
+            # morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                  
             i = 0
 
             self.optimizer.zero_grad(set_to_none=True)
             with autocast():
-                out = self.model(x, morph)                        # dict or tensor
+                out = self.model(x )                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
                 loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
                                                        return_parts=False, 
@@ -643,11 +665,11 @@ class Trainer:
             for batch in self.val_loader:
                 x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
                 target = batch["label"].to(self.device, non_blocking=True)
-                morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
+                # morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
 
                 if self.use_amp:
                     with autocast():
-                        out = self.model(x, morph)
+                        out = self.model(x)
                         logits, yhat, yprob = self._unpack_out(out)
                         loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
                                                                return_parts=False, 
@@ -656,7 +678,7 @@ class Trainer:
                                                                alpha_con=self.cfg.get("alpha_con")
                                                                )
                 else:
-                    out = self.model(x, morph)
+                    out = self.model(x )
                     logits, yhat, yprob = self._unpack_out(out)
                     loss = self.augmix_jsd_loss_from_probs(x, yprob, target,
                                                            eturn_parts=False, 
@@ -671,7 +693,7 @@ class Trainer:
                 n_total   += target.numel()
                 
                 ## make free the memory               
-                del out, logits, yhat, yprob, loss, x, target, morph, preds
+                del out, logits, yhat, yprob, loss, x, target, preds #morph
 
         val_loss = running_loss / max(1, n_total)
         val_acc  = 100.0 * n_correct / max(1, n_total)
@@ -709,46 +731,61 @@ class Trainer:
 
     # ---------- Full fit ----------
     def fit(self):
-        if self.cfg["mode"]=="train": 
+        if self.cfg["mode"] == "train":
             epochs = int(self.cfg.get("epochs", 20))
+
+            save_best_by = self.cfg.get("save_best_by", "val_acc")  # "val_acc" | "val_loss"
+            assert save_best_by in ("val_acc", "val_loss"), f"Unknown save_best_by={save_best_by}"
+
             for epoch in range(1, epochs + 1):
                 tr_loss, tr_acc = self.train_one_epoch(epoch)
                 val_loss, val_acc, lr = self.validate(epoch)
 
-                print(f"Epoch {epoch:02d} | "
+                print(
+                    f"Epoch {epoch:02d} | "
                     f"train_loss={tr_loss:.4f} train_acc={tr_acc:.2f}% | "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}")
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}"
+                )
 
-                # save last
+                # save last (keep both metrics if your save_ckpt supports it; otherwise keep val_acc)
                 self.save_ckpt(self.ckpt_last, epoch, val_acc)
 
-                # save best
-                if val_acc > self.best_val_acc:
-                    self.best_val_acc = val_acc
-                    self.save_ckpt(self.ckpt_best, epoch, val_acc)
-                    print(f"🔥 New best val_acc: {val_acc:.2f}% — saved to {self.ckpt_best}")
+                # decide whether this is the new "best"
+                is_best = False
+                if save_best_by == "val_acc":
+                    if val_acc > self.best_val_acc:
+                        self.best_val_acc = val_acc
+                        is_best = True
+                        best_msg = f"🔥 New best val_acc: {val_acc:.2f}%"
+                else:  # val_loss
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        is_best = True
+                        best_msg = f"🔥 New best val_loss: {val_loss:.4f}"
 
-            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
+                if is_best:
+                    self.save_ckpt(self.ckpt_best, epoch, val_acc)  # or pass val_loss too if you want
+                    print(f"{best_msg} — saved to {self.ckpt_best}")
+
+            self.load_ckpt(self.ckpt_best)
             print("Loaded best checkpoint for final evaluation.")
             self.test(loader=getattr(self, "test_loader", None), name="test")
 
-            # ---- TensorBoard clean up
             if self._rank0 and self.tb is not None:
                 self.tb.flush()
                 self.tb.close()
-        
-        elif self.cfg["mode"]=="test": 
+
+        elif self.cfg["mode"] == "test":
             print("self.ckpt_best-------------", self.ckpt_best)
-            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
+            self.load_ckpt(self.ckpt_best)
             print("Loaded best checkpoint for final evaluation.")
             self.test(loader=getattr(self, "test_loader", None), name="test")
-        
         
         
 
 # ---------- Main ----------
 def main():
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainJsdMorphMIL.yaml"))
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainLungJsdMIL.yaml"))
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
