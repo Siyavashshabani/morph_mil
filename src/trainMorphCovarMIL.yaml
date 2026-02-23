@@ -1,10 +1,9 @@
 ## define the cuda 
-cuda: 4
+cuda: 2
 
 ######################### data 
 dataset: brca
-# h5_dir: "/home/sshabani/projects/CLAM/data_BRCA/data_BRCA_regression/encoded_uni_no_normalization/h5_files"
-h5_dir: "/home/sshabani/projects/CLAM/data_BRCA/data_BRCA_regression/encoded_resnet_no_normalization/h5_files"
+h5_dir: "/home/sshabani/projects/CLAM/data_BRCA/data_BRCA_regression/encoded_uni_no_normalization/h5_files"
 morph_dir: "/home/sshabani/projects/CLAM/data_BRCA/test_resolution/encoded_morphs_csv"
 # morph_dir: "/home/sshabani/projects/CLAM/data_BRCA/test_resolution/encoded_global_morphs_csv"
 labels_csv: "/home/sshabani/projects/CLAM/data_BRCA/preprocess/slides_with_labels_IDC_ILC_with_mag.csv"
@@ -14,34 +13,27 @@ labels_csv: "/home/sshabani/projects/CLAM/data_BRCA/preprocess/slides_with_label
 # h5_dir: "/home/sshabani/projects/camelyon/data/encoded_uni/h5_files"
 # morph_dir: "/home/sshabani/projects/camelyon/data/morphs_csv"
 # labels_csv: "/home/sshabani/projects/camelyon/data/CAMELYON16/evaluation/reference.csv"
+# max_patches: 28000
 
-
-# dataset: lung
-# h5_dir: "/home/sshabani/projects/snuffy/datasets/tcga/encoded_uni/h5_files"
-# labels_csv: "/home/sshabani/projects/snuffy/datasets/tcga/single/patients.csv"
-# max_patches: 80000
-
-
-
-n_classes: 2
 
 ## training 
 mode: train #train #train #test
 batch_size: 1 
-epochs: 10 #30 #16 #3 #200
+epochs: 15 #30 #16 #3 #200
+n_classes: 2
 
 ##optimizer 
-lr: 5e-6 #5e-6 #4e-5
+lr: 5e-5 #5e-6 #4e-5
 wd: 5e-3
 scheduler: plateau
 
 ## model
-backbone: MorphPoolMIL #MorphMIL #TransMIL
+backbone: MorphMIL #TransMIL
 adaptor: vit #fno
-pool: mean #max #max #attn
+pool: mean_median #max #max   attn
 emd_dim: 512 #512 #512 #1024 #1024
-emd_morph_dim: 512 #246 #1024
-input_dim: 1024 #1270 #1536 #1073 ##1270 #1270 #1270 #1024 #1536 #2048
+emd_morph_dim: 246 #246 #1024
+input_dim: 1024 #1270  #1270 #1270 #1270 #1024 #1536 #2048
 input_morph_dim: 246 #246
 trans: nystrom #mamba #att #nystrom att
 ppeg: norm #addaptive #norm
@@ -56,11 +48,11 @@ model_branch: image #both #both #image
 cancat_type: simple #one_to_all #simple #one_to_all
 
 ## loss 
-loss_type: ce # #ce_jsd #ce #ce_jsd #ce_con #ce #jsd #jsd #ce_jsd  #ce_con
+loss_type: ce_covar #ce_covar #ce_jsd #ce_jsd #ce #ce_jsd #ce_con #ce #jsd #jsd #ce_jsd #ce_con
 alpha_jsd: 40 #
 alpha_con: 0.1
+alpha_covar: 0.05
 
 ## augmetation for Jsd
-aug_flag:  False #True #True #True #False
+aug_flag: True #True #True #False
 aug_morph: False #True #True #False
-

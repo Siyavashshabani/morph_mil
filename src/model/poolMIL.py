@@ -208,11 +208,21 @@ class PoolMIL(nn.Module):
 
 
 if __name__ == "__main__":
+    cfg = {
+        "emd_dim": 1024,
+        "input_dim": 2048,   # matches your data's last dim
+        "input_morph_dim": 243,
+        "cuda": 1,           # GPU id
+        "ppeg": "norm",      # or "addaptive"
+    }
+
+    device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
+
     data = torch.randn((1, 16, 2048)).cuda()
     # data = torch.randn((1, 6000, 1024)).cuda()
 
     print("data shape-------------------", data.shape)
-    model = TransMIL(n_classes=2).cuda()
+    model = PoolMIL(cfg, n_classes=2).cuda()
     # print(model.eval())
     results_dict = model(data = data)
     print(results_dict)

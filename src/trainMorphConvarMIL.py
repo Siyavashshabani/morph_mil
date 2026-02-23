@@ -3,7 +3,6 @@
 Training script with a Trainer class.
 """
 import torch.nn.functional as F
-from pathlib import Path
 
 import time, math, argparse, random, yaml
 import sys, os
@@ -13,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataloader.dataloader import train_val_loaders 
 # from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 import numpy as np, os
@@ -44,8 +42,25 @@ from torch.utils.tensorboard import SummaryWriter
 # import timm
 from model.morphMIL import MorphMIL
 from model.poolMIL import PoolMIL
-from model.morphPoolMIL import MorphPoolMIL
 from model.utils import build_scheduler, build_loss
+import os, time
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from loss.contrastiveLoss import SupConLoss
+
+def _finite_stats(name, x):
+    finite = torch.isfinite(x)
+    print(
+        f"{name}: shape={tuple(x.shape)} "
+        f"finite={finite.float().mean().item():.6f} "
+        f"min={x[finite].min().item() if finite.any() else 'NA'} "
+        f"max={x[finite].max().item() if finite.any() else 'NA'}"
+    )
+    if not finite.all():
+        bad = (~finite).sum().item()
+        print(f"  -> {name} has {bad} non-finite values")
 
 
 def _to_numpy(a):
@@ -216,17 +231,33 @@ def build_backbone(cfg):
         device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
         model = MorphMIL(cfg= cfg, n_classes = n_classes).to(device)
         return model
-    elif backbone == "MorphPoolMIL":
-        device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
-        model = MorphPoolMIL(cfg= cfg, n_classes = n_classes).to(device)
-        return model
-    
 
 
 def _unpack_out(out):
     if isinstance(out, dict):
         return out["logits"], out.get("Y_hat"), out.get("Y_prob")
     return out, None, None
+
+
+def cov_matrix(Z: torch.Tensor, unbiased: bool = True, eps: float = 0.0) -> torch.Tensor:
+    """
+    Z: [N, D] -> Cov(Z): [D, D]
+    """
+    if Z.dim() != 2:
+        raise ValueError(f"Expected [N, D], got {tuple(Z.shape)}")
+
+    N, D = Z.shape
+    if unbiased and N < 2:
+        raise ValueError("Need N >= 2 for unbiased covariance (N-1 in denominator).")
+
+    Zc = Z - Z.mean(dim=0, keepdim=True)
+    denom = (N - 1) if unbiased else N
+    C = (Zc.T @ Zc) / denom  # [D, D]
+
+    if eps > 0:
+        C = C + eps * torch.eye(D, device=Z.device, dtype=Z.dtype)
+
+    return C
 
 # ---------- Trainer Class ----------
 class Trainer:
@@ -257,7 +288,7 @@ class Trainer:
                 pin_memory=True,
                 use_weighted_sampler= False, #True
                 aug_flag=cfg.get("aug_flag"),
-                max_patches = cfg.get("max_patches")
+                max_patches = cfg.get("max_patches"),
             )
         elif self.dataset=="camelyon":
             print("camelyon-----------------------------------------------")
@@ -269,34 +300,14 @@ class Trainer:
                 val_ratio=0.2,
                 seed=42,
                 batch_size=1,
-                num_workers=4,
+                num_workers=1,
                 pin_memory=True,
                 use_weighted_sampler= False, #True
                 aug_flag=cfg.get("aug_flag"),
-                max_patches = cfg.get("max_patches")
-
-            )
-        elif self.dataset=="lung":
-            print("lung-----------------------------------------------")
-            from dataloader.dataloaderLung import train_val_loaders 
-            self.train_loader, self.val_loader, self.test_loader = train_val_loaders(
-                h5_dir=cfg.get("h5_dir"),
-                labels_csv=cfg.get("labels_csv"),
-                val_ratio=0.2,
-                seed=42,
-                batch_size=1,
-                num_workers=4,
-                pin_memory=True,
-                aug_flag=cfg.get("aug_flag"),
-                max_patches = cfg.get("max_patches")
+                max_patches = cfg.get("max_patches"),
             )
 
 
-        else:
-            raise ValueError(
-                f"Unknown dataset={self.dataset!r}. Expected one of: ['brca', 'camelyon']"
-            )
-        
         # Model / Optim / Loss
         base_dim = self.cfg.get("base_input_dim", 1024)
         morph_dim = self.cfg.get("morph_dim", 246)
@@ -318,32 +329,36 @@ class Trainer:
         
         ## define the lossfunction
         # weights = torch.tensor([1.0, 61/9], device=self.device )  # use your train counts
-        self.loss_fn = nn.CrossEntropyLoss()
-        self.best_val_acc = -math.inf
-        self.best_val_loss = math.inf
+        # self.loss_fn = nn.CrossEntropyLoss(weight=weights )
 
         # AMP
         self.use_amp = bool(cfg.get("amp", True)) and torch.cuda.is_available()
         self.scaler = GradScaler(enabled=self.use_amp)
 
-        ################################## Checkpoints
-        
         # ---- run id / folder name ----
         self.run_name = self.cfg.get("run_name", "exp")
         run_id = self.cfg.get("run_id", time.strftime("%Y%m%d-%H%M%S"))  # or uuid4()
+
         # root folder for everything in this run
         self.run_dir = Path(self.cfg.get("run_root", "experiments")) / f"{self.run_name}-{run_id}"
+
+        # only rank0 creates dirs and writes ckpts/tb
+        self._rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+        if self._rank0:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- checkpoints ----
         self.outdir = str(self.run_dir / "checkpoints")
-        os.makedirs(self.outdir, exist_ok=True)
+        if self._rank0:
+            os.makedirs(self.outdir, exist_ok=True)
+
         self.ckpt_best = os.path.join(self.outdir, "best.pt")
         self.ckpt_last = os.path.join(self.outdir, "last.pt")
         self.best_val_acc = -1.0
 
-        ## tensorboard 
-        self.run_name = self.cfg.get("run_name", "exp")
-        self.tb_dir   = self.cfg.get("tb_dir", f"runs/{self.run_name}-{time.strftime('%Y%m%d-%H%M%S')}")
-        self._rank0   = (not dist.is_initialized()) or dist.get_rank() == 0
-        self.tb       = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
+        # ---- tensorboard ----
+        self.tb_dir = str(self.run_dir / "tb")
+        self.tb = SummaryWriter(log_dir=self.tb_dir) if self._rank0 else None
 
         self.global_step = 0   # increments each train step
 
@@ -365,24 +380,145 @@ class Trainer:
         return lrs[0] if len(lrs) == 1 else lrs
 
 
+    def augmix_jsd_loss_from_probs(
+        self,
+        feats: torch.Tensor,          # [3, N, D] (or similar)
+        yprob: torch.Tensor,          # [3, C] probabilities
+        target: torch.Tensor,         # scalar or [1]
+        alpha_jsd: float = 50.0,
+        alpha_covar: float = 50.0,
+        alpha_con: float = 50.0,
+        eps: float = 0, #1e-7,
+        return_parts: bool = True,
+        loss_type: str = "ce_jsd",    # "ce", "jsd", "ce_jsd", "ce_con", "ce_covar"
+        temperature: float = 0.1,
+    ):
+        # -------------------------
+        # checks + canonical dtypes
+        # -------------------------
+        if yprob.dim() != 2 or yprob.size(0) != 3:
+            raise ValueError(f"Expected yprob [3, C], got {tuple(yprob.shape)}")
+
+        yprob = yprob.float()  # probs to float32 for stability
+
+        target = torch.as_tensor(target, device=yprob.device, dtype=torch.long)
+        if target.dim() == 0:
+            target = target.view(1)
+        if target.dim() != 1 or target.numel() != 1:
+            raise ValueError(f"target must be scalar or [1], got {tuple(target.shape)}")
+
+        # --------------------------------
+        # split probabilities: [1, C] each
+        # --------------------------------
+        p_clean = yprob[0:1]
+        p_aug1  = yprob[1:2]
+        p_aug2  = yprob[2:3]
+        del yprob  # free
+
+        # -------------------------
+        # CE (on clean) from probs
+        # -------------------------
+        p_clean_log = torch.log(torch.clamp(p_clean, eps, 1.0))
+        ce = F.nll_loss(p_clean_log, target)
+
+        # -------------------------
+        # features (3 views) -- only needed for covar/con paths
+        # -------------------------
+        con = torch.zeros((), device=ce.device, dtype=ce.dtype)  # placeholder for return_parts
+
+        # -------------------------
+        # choose loss (compute only what you need)
+        # -------------------------
+        if loss_type == "ce":
+            jsd = torch.zeros((), device=ce.device, dtype=ce.dtype)
+            loss = ce
+
+        elif loss_type == "jsd":
+            # JSD (AugMix style)
+            p_mix = (p_clean + p_aug1 + p_aug2) / 3.0
+            p_mix_log = torch.log(torch.clamp(p_mix, eps, 1.0))
+
+            kl_clean = F.kl_div(p_mix_log, p_clean, reduction="batchmean")
+            kl_aug1  = F.kl_div(p_mix_log, p_aug1,  reduction="batchmean")
+            kl_aug2  = F.kl_div(p_mix_log, p_aug2,  reduction="batchmean")
+            jsd = (kl_clean + kl_aug1 + kl_aug2) / 3.0
+
+            loss = jsd
+
+        elif loss_type == "ce_jsd":
+            # JSD (AugMix style)
+            p_mix = (p_clean + p_aug1 + p_aug2) / 3.0
+            p_mix_log = torch.log(torch.clamp(p_mix, eps, 1.0))
+
+            kl_clean = F.kl_div(p_mix_log, p_clean, reduction="batchmean")
+            kl_aug1  = F.kl_div(p_mix_log, p_aug1,  reduction="batchmean")
+            kl_aug2  = F.kl_div(p_mix_log, p_aug2,  reduction="batchmean")
+            jsd = (kl_clean + kl_aug1 + kl_aug2) / 3.0
+
+            loss = ce + alpha_jsd * jsd
+
+        elif loss_type == "ce_covar":
+                # features needed here
+                x_clean = feats[0:1].float().squeeze(0)
+                x_aug1  = feats[1:2].float().squeeze(0)
+                x_aug2  = feats[2:3].float().squeeze(0)
+                with torch.cuda.amp.autocast(enabled=False):
+
+                    # _finite_stats("x_clean", x_clean)
+                    # _finite_stats("x_aug1", x_aug1)
+                    # _finite_stats("x_aug2", x_aug2)
+                    C0 = cov_matrix(x_clean, unbiased=True, eps=eps)
+                    C1 = cov_matrix(x_aug1,  unbiased=True, eps=eps)
+                    C2 = cov_matrix(x_aug2,  unbiased=True, eps=eps)
+                    
+                    # print(torch.isfinite(C0).all(), torch.isfinite(C1).all(), torch.isfinite(C2).all())
+
+                    loss_aug1 = torch.linalg.norm(C0 - C1) #, ord= "fro"
+                    loss_aug2 = torch.linalg.norm(C0 - C2)
+                    # print("loss_aug1-----------------------", loss_aug1)
+                    # print("loss_aug2-----------------------", loss_aug2)
+                    loss_covar = (loss_aug1 + loss_aug2) / 2.0
+
+                    # jsd = torch.zeros((), device=ce.device, dtype=ce.dtype)
+                    loss = ce + alpha_covar * loss_covar
+                    # print("loss---------------------------------------------------", loss)
+        else:
+            raise ValueError(
+                f"Unknown loss_type='{loss_type}'. Use: ce, jsd, ce_jsd, ce_con, ce_covar"
+            )
+
+        if return_parts:
+            return {
+                "loss": loss,
+                "ce": ce.detach(),
+                "jsd": jsd.detach(),
+                "con": con.detach(),
+            }
+        return loss
+            
+        # return loss, {"ce": ce, "jsd": jsd, "kl_clean": kl_clean, "kl_aug1": kl_aug1, "kl_aug2": kl_aug2}
+
+
+
+
     @torch.no_grad()
     def _predict_on_loader(self, loader):
         self.model.eval()
         y_true, y_pred, y_prob = [], [], []
         for batch in loader:
-            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)    # (B,16,2048)
+            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
             y = batch["label"].to(self.device, non_blocking=True)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
+            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                   
             if self.use_amp:
-                    with autocast(dtype=torch.float16):
-                        out = self.model(x, morph)
+                with autocast():
+                    out = self.model(x, morph)
             else:
                 out = self.model(x, morph)
 
             logits, yhat, yprob = self._unpack_out(out)  # your existing helper
             print("logits, yhat, yprob--------------", logits.shape, yhat.shape, yprob.shape)
-            preds = yhat if yhat is not None else logits.argmax(dim=1)
-            probs = yprob if yprob is not None else torch.softmax(logits, dim=1)
+            preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
+            probs = yprob[0:1] if yprob[0:1] is not None else torch.softmax(logits[0:1], dim=1)
 
             y_true.append(y.detach().cpu())
             y_pred.append(preds.detach().cpu())
@@ -408,7 +544,7 @@ class Trainer:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_grad_enabled(False)
 
-        loader = loader or getattr(self, "test_loader", None) or self.val_loader
+        loader = loader or getattr(self, "test_loader", None) or self.test_loader
 
         # Expect these from your implementation
         y_true, y_pred, y_prob = self._predict_on_loader(loader)
@@ -457,9 +593,6 @@ class Trainer:
             raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm.png")
             norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['pool']}_cm_norm.png")
            
-        elif self.cfg["backbone"]=="MorphPoolMIL":
-            raw_path  = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['MorphPool']}_cm.png")
-            norm_path = os.path.join(out_dir, f"{name}_{self.cfg['backbone']}_{self.cfg['MorphPool']}_cm_norm.png")
          
         _save_cm_png(cm, class_names, raw_path,  normalize=False, title=f"{name} • Confusion Matrix")
         _save_cm_png(cm, class_names, norm_path, normalize=True,  title=f"{name} • Confusion Matrix (row-norm)")
@@ -490,34 +623,40 @@ class Trainer:
         running_loss, n_correct, n_total = 0.0, 0, 0
 
         for step, batch in enumerate(self.train_loader, 1):
-            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)  # (B,16,2048)
-            y = batch["label"].to(self.device, non_blocking=True)   # (B,)
-            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
+            x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
+            # print("x.shape-----------------------", x.shape)
+            target = batch["label"].to(self.device, non_blocking=True)  # (B,)
+            morph = batch["morph"].to(self .device, dtype=torch.float16, non_blocking=True).unsqueeze(0)                  
             i = 0
+
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast(dtype=torch.float16):
+            with autocast():
                 out = self.model(x, morph)                        # dict or tensor
                 logits, yhat, yprob = self._unpack_out(out)
-                # print("logits------------------------", logits.shape)
-                # print("yhat--------------------------", yhat.shape, yhat)
-                # print("yprob-------------------------", yprob.shape, yprob)
-                # print("y-----------------------------", y.shape)
+                loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
+                                                        return_parts=False, 
+                                                        loss_type= self.cfg.get("loss_type"),      
+                                                        alpha_jsd=self.cfg.get("alpha_jsd"),
+                                                        alpha_con=self.cfg.get("alpha_con"),
+                                                        alpha_covar=self.cfg.get("alpha_covar"),
+                                                       )
+                # print("loss_total:", loss.item())
                 # exit()
-                loss = self.loss_fn(logits, y)
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
 
             running_loss += loss.item() * x.size(0)
-            preds = yhat if yhat is not None else logits.argmax(dim=1)
-            n_correct += (preds == y).sum().item()
-            n_total   += y.numel()
+            preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
+            n_correct += (preds == target).sum().item()
+            n_total   += target.numel()
 
             # ---- TensorBoard: step logs (rank-0 only)
             if self._rank0 and self.tb is not None:
                 # step-wise (use batch accuracy so it’s not noisy from running totals)
-                batch_acc = (preds == y).float().mean().item() * 100.0
+                batch_acc = (preds == target).float().mean().item() * 100.0
                 self.tb.add_scalar("train/loss_step", loss.item(), self.global_step)
                 self.tb.add_scalar("train/acc_step",  batch_acc,  self.global_step)
                 self.tb.add_scalar("train/lr",        self._get_lr(), self.global_step)
@@ -548,24 +687,40 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0) 
-                y = batch["label"].to(self.device, non_blocking=True)
+                x = batch["feats"].to(self.device, dtype=torch.float16, non_blocking=True)   # (B,16,2048)
+                target = batch["label"].to(self.device, non_blocking=True)
                 morph = batch["morph"].to(self.device, dtype=torch.float16, non_blocking=True).unsqueeze(0)               
 
                 if self.use_amp:
-                    with autocast(dtype=torch.float16):
+                    with autocast():
                         out = self.model(x, morph)
                         logits, yhat, yprob = self._unpack_out(out)
-                        loss = self.loss_fn(logits, y)
+                        loss = self.augmix_jsd_loss_from_probs(x, yprob, target, 
+                                                               return_parts=False, 
+                                                               loss_type= self.cfg.get("loss_type"),
+                                                               alpha_jsd=self.cfg.get("alpha_jsd"),
+                                                               alpha_con=self.cfg.get("alpha_con"),
+                                                               alpha_covar=self.cfg.get("alpha_covar"),
+
+                                                               )
                 else:
                     out = self.model(x, morph)
                     logits, yhat, yprob = self._unpack_out(out)
-                    loss = self.loss_fn(logits, y)
+                    loss = self.augmix_jsd_loss_from_probs(x, yprob, target,
+                                                           eturn_parts=False, 
+                                                           loss_type= self.cfg.get("loss_type"),
+                                                           alpha_jsd=self.cfg.get("alpha_jsd"),
+                                                           alpha_con=self.cfg.get("alpha_con"),
+                                                           alpha_covar=self.cfg.get("alpha_covar"),                                                        
+                                                           )
 
                 running_loss += loss.item() * x.size(0)
-                preds = yhat if yhat is not None else logits.argmax(dim=1)
-                n_correct += (preds == y).sum().item()
-                n_total   += y.numel()
+                preds = yhat[0:1] if yhat[0:1] is not None else logits[0:1].argmax(dim=1)
+                n_correct += (preds == target).sum().item()
+                n_total   += target.numel()
+                
+                ## make free the memory               
+                del out, logits, yhat, yprob, loss, x, target, morph, preds
 
         val_loss = running_loss / max(1, n_total)
         val_acc  = 100.0 * n_correct / max(1, n_total)
@@ -602,67 +757,47 @@ class Trainer:
         return ckpt
 
     # ---------- Full fit ----------
-    # ---------- Full fit ----------
     def fit(self):
-        if self.cfg["mode"] == "train":
+        if self.cfg["mode"]=="train": 
             epochs = int(self.cfg.get("epochs", 20))
-
-            save_best_by = self.cfg.get("save_best_by", "val_loss")  # "val_acc" | "val_loss"
-            assert save_best_by in ("val_acc", "val_loss"), f"Unknown save_best_by={save_best_by}"
-
             for epoch in range(1, epochs + 1):
                 tr_loss, tr_acc = self.train_one_epoch(epoch)
                 val_loss, val_acc, lr = self.validate(epoch)
 
-                print(
-                    f"Epoch {epoch:02d} | "
+                print(f"Epoch {epoch:02d} | "
                     f"train_loss={tr_loss:.4f} train_acc={tr_acc:.2f}% | "
-                    f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}"
-                )
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% lr={lr:.6f}")
 
-                # save last (keep both metrics if your save_ckpt supports it; otherwise keep val_acc)
+                # save last
                 self.save_ckpt(self.ckpt_last, epoch, val_acc)
 
-                # decide whether this is the new "best"
-                is_best = False
-                if save_best_by == "val_acc":
-                    if val_acc > self.best_val_acc:
-                        self.best_val_acc = val_acc
-                        is_best = True
-                        best_msg = f"🔥 New best val_acc: {val_acc:.2f}%"
-                else:  # val_loss
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                        is_best = True
-                        best_msg = f"🔥 New best val_loss: {val_loss:.4f}"
+                # save best
+                if val_acc > self.best_val_acc:
+                    self.best_val_acc = val_acc
+                    self.save_ckpt(self.ckpt_best, epoch, val_acc)
+                    print(f"🔥 New best val_acc: {val_acc:.2f}% — saved to {self.ckpt_best}")
 
-                if is_best:
-                    self.save_ckpt(self.ckpt_best, epoch, val_acc)  # or pass val_loss too if you want
-                    print(f"{best_msg} — saved to {self.ckpt_best}")
-
-            self.load_ckpt(self.ckpt_best)
+            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
             print("Loaded best checkpoint for final evaluation.")
-            self.test(loader=getattr(self, "test_loader", None), name="test")
+            self.test(loader=getattr(self, "val_loader", None), name="test")
 
+            # ---- TensorBoard clean up
             if self._rank0 and self.tb is not None:
                 self.tb.flush()
                 self.tb.close()
-
-        elif self.cfg["mode"] == "test":
+        
+        elif self.cfg["mode"]=="test": 
             print("self.ckpt_best-------------", self.ckpt_best)
-            self.load_ckpt(self.ckpt_best)
+            self.load_ckpt(self.ckpt_best)   # implement this if you haven't
             print("Loaded best checkpoint for final evaluation.")
             self.test(loader=getattr(self, "test_loader", None), name="test")
         
         
         
 
-
-
-
 # ---------- Main ----------
 def main():
-    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainMorphMIL.yaml"))
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src/trainMorphCovarMIL.yaml"))
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -674,7 +809,6 @@ def main():
     # full training        
     trainer.fit()
     print(cfg)
-    
 
 if __name__ == "__main__":
     main()

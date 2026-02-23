@@ -63,4 +63,4 @@ aug_flag: True #True #True #False
 aug_morph: False #True #True #False
 
 
-save_best_by: val_loss #val_loss
+save_best_by: val_loss #val_acc #val_loss

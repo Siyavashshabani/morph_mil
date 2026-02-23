@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from nystrom_attention import NystromAttention
-from .augment import TensorAugment
+from .adaptorMorph import AdaptorViT
 
 # --- Mamba wrapper (expects x: [B, N, D]) ---
 try:
@@ -131,104 +131,122 @@ class PPEG(nn.Module):
         x = torch.cat((cls_token.unsqueeze(1), x), dim=1)
         return x
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-class AdaptorViT(nn.Module):
-    def __init__(self, cfg ):
-        super(AdaptorViT, self).__init__()
-        self.emd_dim = cfg.get("emd_morph_dim", 512)
-        self.input_dim = cfg.get("input_morph_dim", 1024)
-        self.aug_flag = cfg.get("aug_morph", False)
-        self.game_theory = cfg.get("game_theory", False)
-        
-        ## define the gpu ids
-        gpu_id = cfg.get("cuda", 0)
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{gpu_id}")
+class MorphPoolMIL(nn.Module):
+    """
+    pool options:
+      - "mean"         : [B,N,2048] -> [B,1,2048]
+      - "max"          : [B,N,2048] -> [B,1,2048]
+      - "attn"         : [B,N,2048] -> [B,1,2048] (learned attention)
+      - "mean_median"  : [B,N,2048] -> [B,1,4096] (concat mean & median)
+    """
+    def __init__(self, cfg, n_classes=2):
+        super().__init__()
+        self.n_classes = n_classes
+        self.emd_dim   = cfg.get("emd_dim", 512)
+        self.input_dim   = cfg.get("input_dim", 1024)
+        self.dropout_p = cfg.get("dropout", 0.2)
+        self.pool_type = cfg.get("pool", "mean")
+        self.model_branch = cfg.get("model_branch")
 
-        self._fc1 = nn.Sequential(nn.Linear(self.input_dim, self.emd_dim), nn.ReLU())
-        self.layer1 = TransLayer(cfg, dim=self.emd_dim )
-        # self.layer2 = TransLayer(cfg, dim=self.emd_dim )
+        # infer pooled feature dim based on pool type
+        # if self.pool_type == "mean_median":
+        #     pooled_in_dim = 2048 * 2
+        # else:
+        #     pooled_in_dim = 2048
 
-        self.aug = TensorAugment(
-            # drop more tokens, more often
-            p_token_drop=0.45, token_drop_frac=0.30, token_drop_mode="zero",
+        # optional attention pooling
+        # if self.pool_type == "attn":
+        #     self.attn = nn.Sequential(
+        #         nn.Linear(2048, self.emd_dim/2),
+        #         nn.Tanh(),
+        #         nn.Linear(self.emd_dim, 1)
+        #     )
 
-            # shuffle more often; increase local disruption
-            p_token_shuffle=0.40, local_shuffle=True, local_window=8,
-
-            # mask longer spans more often
-            p_token_span_mask=0.45, token_span_frac=0.45,
-
-            # stronger feature noise
-            p_feat_jitter=0.80, feat_jitter_sigma=0.06,
-
-            # mask more feature bands
-            p_feat_band_mask=0.55, feat_band_frac=0.20,
-
-            # stronger scale/shift jitter
-            p_feat_affine=0.55, affine_scale_std=0.20, affine_shift_std=0.05,
-
-            # cut out bigger rectangles more often
-            p_rect_cutout=0.45, rect_token_frac=0.45, rect_feat_frac=0.30
+        # two fully connected layers after pooling
+        self.fc1 = nn.Sequential(
+            nn.Linear(self.input_dim, self.emd_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_p),
         )
+        self.fc2 = nn.Linear(self.emd_dim, self.n_classes)
 
-        self.aug_light = TensorAugment(
-            p_token_drop=0.20, token_drop_frac=0.12, token_drop_mode="zero",
-            p_token_shuffle=0.15, local_shuffle=True, local_window=6,
-            p_token_span_mask=0.25, token_span_frac=0.25,
-            p_feat_jitter=0.55, feat_jitter_sigma=0.03,
-            p_feat_band_mask=0.30, feat_band_frac=0.10,
-            p_feat_affine=0.25, affine_scale_std=0.10, affine_shift_std=0.02,
-            p_rect_cutout=0.20, rect_token_frac=0.25, rect_feat_frac=0.18
-        )  
+        ### morph encoder        
+        self.adaptor_morph = AdaptorViT(cfg)
 
-    def forward(self, data):
+    def _pool(self, h):  # h: [B, N, 2048] -> [B, 1, D]
+        # print("self.pool_type-------------------------------", self.pool_type)
+        if self.pool_type == "mean":
+            out = h.mean(dim=1)                           # [B,2048]
+            return out.unsqueeze(1)                       # [B,1,2048]
+        elif self.pool_type == "max":
+            out = h.max(dim=1).values                     # [B,2048]
+            return out.unsqueeze(1)
+        elif self.pool_type == "attn":
+            a = self.attn(h).squeeze(-1)                  # [B,N]
+            a = torch.softmax(a, dim=1)                   # [B,N]
+            return torch.bmm(a.unsqueeze(1), h)           # [B,1,2048]
+        elif self.pool_type == "mean_median":
+            mu  = h.mean(dim=1)                           # [B,2048]
+            med = h.median(dim=1).values                  # [B,2048]
+            out = torch.cat([mu, med], dim=-1)            # [B,4096]
+            return out.unsqueeze(1)                       # [B,1,4096]
+        else:
+            raise ValueError(f"Unknown pool='{self.pool_type}'")
+
+    def forward(self, image, morph):
         
-        h = data.float() #[B, n, 1024]
+        if self.model_branch== "both": 
+            ############### Morph encoder
+            morph = self.adaptor_morph(morph)
+            ############### Concate morph and iamge embedded
+            h = torch.cat([image.float(), morph.float()]
+                    , dim = 2)
+            
+            pooled = self._pool(h).squeeze(1)                 # [B, D]
+            x = self.fc1(pooled)                              # [B, emd_dim]
+            logits = self.fc2(x)                              # [B, n_classes]
 
-        # print("h.shape----------------------", h.shape)
-        h = self._fc1(h) #[B, n, 512]
+        elif self.model_branch== "image":
+            h = image.float()
+            pooled = self._pool(h).squeeze(1)                 # [B, D]
+            x = self.fc1(pooled)                              # [B, emd_dim]
+            logits = self.fc2(x)                              # [B, n_classes]
 
-        #---->Translayer x1
-        h = self.layer1(h) #[B, N, 512]
-
-        #---->Translayer x2
-        # h = self.layer2(h) #[B, N, 512]
-
-        if self.aug_flag == True: 
-            if self.game_theory:
-                h_aug1 = self.aug(h.clone())
-                h = torch.stack([h, h_aug1], dim=0).squeeze(1)
-                
-            else: 
-                h_aug1 = self.aug(h.clone())
-                h_aug2 = self.aug_light(h.clone())
-                h = torch.stack([h, h_aug1, h_aug2], dim=0).squeeze(1)
-
-        return h 
-    
+        Y_prob = F.softmax(logits, dim=1)                 # use CrossEntropyLoss
+        Y_hat  = torch.argmax(logits, dim=1)
+        return {"logits": logits, "Y_prob": Y_prob, "Y_hat": Y_hat}
+        
 
 
-######################################################################### 
-######################################################################### Fourier Neural Operator(FNO)
-
-
-
-
-    
 if __name__ == "__main__":
     cfg = {
         "emd_dim": 1024,
-        "input_morph_dim": 243,   # matches your data's last dim
+        "input_dim": 1024, #1536,   # matches your data's last dim
+        "input_morph_dim": 246,
         "cuda": 1,           # GPU id
         "ppeg": "norm",      # or "addaptive"
+        "emd_morph_dim": 512,
+        "aug_morph": False,
+        "model_branch": "image" #"both" #image
+        
     }
 
     device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else "cpu")
 
-    data = torch.randn((1, 16, 243), device=device)
+    image = torch.randn((1, 16, 1024)).cuda()
+    morph = torch.randn((1, 16, 246)).cuda()
 
-    model = AdaptorViT(cfg=cfg).to(device)
+    # data = torch.randn((1, 6000, 1024)).cuda()
 
-    results_dict = model(data=data)
-    print(results_dict.shape)
+    print("image shape-------------------", image.shape)
+    model = MorphPoolMIL(cfg, n_classes=2).cuda()
+    # print(model.eval())
+    results_dict = model(image, morph)
+    print(results_dict)
